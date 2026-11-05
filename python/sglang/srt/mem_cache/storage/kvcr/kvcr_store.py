@@ -123,6 +123,7 @@ class KVCRStore(HiCacheStorage):
         # scope -> physical trailing-state keys and their local-DRAM claims.
         # A router FETCHABLE verdict alone does not prove source residency.
         self._lookup_claims = {}
+        self._move_scopes = {}
         self._poll_thread = None
         self._stop_poll = threading.Event()
         self._closed = False
@@ -157,8 +158,8 @@ class KVCRStore(HiCacheStorage):
         self._enable_move_hint = _bool_option(self._extra, "enable_move_hint")
         self._align_storage_prefix = _bool_option(self._extra, "align_storage_prefix")
         self._diagnostic_telemetry = _bool_option(self._extra, "diagnostic_telemetry")
-        self.supports_combined_page_reads = _bool_option(
-            self._extra, "combine_page_reads"
+        self.supports_combined_page_reads = (
+            _bool_option(self._extra, "combine_page_reads") or self._enable_move_hint
         )
         self.supports_combined_page_writes = _bool_option(
             self._extra, "combine_page_writes"
@@ -418,7 +419,7 @@ class KVCRStore(HiCacheStorage):
             os._exit(1)
         logger.warning("KVCR resilience event: %s", error)
 
-    def _operation_hint(self, extra_info, keys=None):
+    def _operation_hint(self, extra_info, keys=None, *, mode=None):
         hint = (
             peer_hint(
                 extra_info,
@@ -430,6 +431,8 @@ class KVCRStore(HiCacheStorage):
             else None
         )
         if hint is not None:
+            if mode is not None:
+                hint["actions"][0]["payload"]["mode"] = mode
             return hint
         if not self._share_replicated_mla or self.config.tp_rank == 0 or not keys:
             return None
@@ -456,9 +459,9 @@ class KVCRStore(HiCacheStorage):
         }
 
     @contextmanager
-    def _hint(self, extra_info, keys=None):
+    def _hint(self, extra_info, keys=None, *, mode=None):
         request_id = None
-        hint = self._operation_hint(extra_info, keys)
+        hint = self._operation_hint(extra_info, keys, mode=mode)
         if hint is not None:
             request_id = uuid.uuid4().hex
             self._runner.submit_hint(
@@ -474,39 +477,165 @@ class KVCRStore(HiCacheStorage):
         hint = self._operation_hint(extra_info, keys)
         return hint is not None and hint["actions"][0]["payload"]["mode"] == "move"
 
-    def _move_read(self, blocks, request_id):
-        """Retain move pages in this KVCR, then copy them into host pages.
+    def _move_read(self, blocks, extra_info):
+        """Copy and pin first; invalidate only complete rank-local restores.
 
-        KVCR deliver always copies; only fetch keeps a destination copy and
-        lets the source drop its own. The fetch claims pin that copy until the
-        local delivery has finished.
+        Hybrid lookup scopes span KV batches and the later checkpoint delivery.
+        Their claims stay held until all required pools have been delivered or
+        the controller releases the lookup. Ranks commit independently.
         """
+        extra = getattr(extra_info, "extra_info", None) or {}
+        scope = extra.get("storage_lookup_scope")
+        state = self._move_scopes.get(scope)
+        scoped = state is not None
+        if state is None:
+            state = {"claims": [], "delivered": set(), "expected": set()}
         by_layout = {}
         for key, refs in blocks.items():
             by_layout.setdefault(tuple(ref.label for ref in refs), []).append(key)
         claims, fetched = [], {}
         try:
-            for labels, keys in by_layout.items():
-                result = self._wait(
-                    self._runner.fetch(
-                        keys, request_id=request_id, expected_layout=list(labels)
+            with self._hint(extra_info, blocks, mode="copy") as request_id:
+                for labels, keys in by_layout.items():
+                    result = self._wait(
+                        self._runner.fetch(
+                            keys, request_id=request_id, expected_layout=list(labels)
+                        )
                     )
-                )
-                for key in keys:
-                    entry = result.get(key)
-                    if entry is None or not entry.success:
-                        continue
-                    if entry.release_handle is None:
-                        continue
-                    claims.append(entry.release_handle)
-                    fetched[key] = blocks[key]
+                    for key in keys:
+                        entry = result.get(key)
+                        if entry is None or not entry.success:
+                            continue
+                        if entry.release_handle is None:
+                            continue
+                        claims.append(entry.release_handle)
+                        fetched[key] = blocks[key]
             if not fetched:
+                self._log_move(extra_info, blocks, {}, set())
                 return None, {}
             handle = self._runner.deliver(fetched)
-            return handle, self._wait(handle)
+            result = self._wait(handle)
+            delivered = {key for key, entry in result.items() if entry.success}
+            # A wait unlocks the adapter: cancellation may have released this
+            # operation while its copy was in flight. Never commit a dead scope.
+            if scoped and self._move_scopes.get(scope) is not state:
+                self._log_move(extra_info, blocks, result, set())
+                return handle, result
+            state["delivered"].update(delivered)
+            state["claims"].extend(claims)
+            claims = []
+            if scoped:
+                ready = state["expected"].issubset(state["delivered"])
+                complete = state["expected"] if ready else set()
+            else:
+                pools = set(self._layouts) - _TRAILING_POOLS
+                pages = {key.split(b"#", 1)[0].decode() for key in blocks}
+                complete = set()
+                for page in pages:
+                    required = {
+                        block_key(page, self._namespace, name) for name in pools
+                    }
+                    if (
+                        not (set(self._layouts) & _TRAILING_POOLS)
+                        and required
+                        and required.issubset(delivered)
+                    ):
+                        complete.update(required)
+            if complete:
+                # Cancellation during phase two must not unpin another pool
+                # before its local-hit invalidation has been submitted.
+                claims, state["claims"] = state["claims"], []
+            invalidated = self._invalidate_move(complete, extra_info)
+            self._log_move(extra_info, blocks, result, invalidated, complete)
+            return handle, result
+        except Exception:
+            if scoped and self._move_scopes.get(scope) is state:
+                self._release_lookup_locked(scope)
+            raise
         finally:
             if claims:
                 self._release_claim_handles(claims)
+            if not scoped:
+                self._release_claim_handles(state["claims"])
+
+    def _invalidate_move(self, keys, extra_info):
+        """Request best-effort source cleanup while every local copy is pinned."""
+        by_pool = {}
+        for key in keys:
+            name = key.decode().rsplit("#", 1)[1]
+            by_pool.setdefault(name, []).append(key)
+        requested = set()
+        for name, pending in by_pool.items():
+            try:
+                with self._hint(extra_info, pending, mode="move") as request_id:
+                    result = self._wait(
+                        self._runner.fetch(
+                            pending,
+                            request_id=request_id,
+                            expected_layout=[
+                                p.name for p in self._layouts[name].components
+                            ],
+                        )
+                    )
+            except Exception:
+                logger.warning(
+                    "KVCR move cleanup failed for pool %s", name, exc_info=True
+                )
+                continue
+            handles = []
+            for key, entry in result.items():
+                if entry.success and entry.release_handle is not None:
+                    handles.append(entry.release_handle)
+                    requested.add(key)
+            self._release_claim_handles(handles)
+        return requested
+
+    def _log_move(self, extra_info, blocks, results, invalidated, complete=()):
+        if not self._diagnostic_telemetry:
+            return
+        extra = getattr(extra_info, "extra_info", None) or {}
+        pages = {key.split(b"#", 1)[0].decode() for key in blocks}
+        failed = {
+            key.split(b"#", 1)[0].decode()
+            for key in blocks
+            if key not in results or not results[key].success
+        }
+        moved_pages = {key.split(b"#", 1)[0].decode() for key in complete}
+        invalidated_pages = {
+            page
+            for page in moved_pages
+            if {
+                key for key in complete if key.startswith(page.encode() + b"#")
+            }.issubset(invalidated)
+        }
+        logger.info(
+            "KVCR L3 move outcome %s",
+            json.dumps(
+                {
+                    "epoch": time.time(),
+                    "request_id": extra.get("request_id"),
+                    "scope": extra.get("storage_lookup_scope"),
+                    "rank": self._offset,
+                    "tp_rank": self.config.tp_rank,
+                    "cp_rank": self.config.attn_cp_rank,
+                    "endpoint": self._control_endpoint,
+                    "delivered_pages": sorted(pages - failed),
+                    "failed_pages": sorted(failed),
+                    "moved_pages": sorted(moved_pages),
+                    "pages_moved": len(moved_pages),
+                    "pages_failed": len(failed),
+                    "pages_invalidation_requested": len(invalidated_pages),
+                    "invalidation_failed_pages": sorted(
+                        moved_pages - invalidated_pages
+                    ),
+                    # Native completion does not acknowledge source deletion.
+                    "invalidation_requested_keys": sorted(
+                        k.decode() for k in invalidated
+                    ),
+                },
+                separators=(",", ":"),
+            ),
+        )
 
     def _wait(self, handle):
         # There can be concurrent backup and prefetch threads. One caller may
@@ -703,7 +832,7 @@ class KVCRStore(HiCacheStorage):
                 )
                 if move:
                     # Both the fetch and the local delivery wait in here.
-                    handle, result = self._move_read(blocks, request_id)
+                    handle, result = self._move_read(blocks, extra_info)
                     submitted = time.perf_counter() if diagnostic else None
                 else:
                     handle = (
@@ -991,6 +1120,9 @@ class KVCRStore(HiCacheStorage):
             raise RuntimeError("KVCR trailing-state claim release failed")
 
     def _release_lookup_locked(self, scope):
+        move = self._move_scopes.pop(scope, None)
+        if move is not None:
+            self._release_claim_handles(move["claims"])
         claims = self._lookup_claims.get(scope)
         if not claims:
             self._lookup_claims.pop(scope, None)
@@ -1044,7 +1176,7 @@ class KVCRStore(HiCacheStorage):
             try:
                 for name, pending in windows.items():
                     labels = [part.name for part in self._layouts[name].components]
-                    with self._hint(extra_info, pending) as request_id:
+                    with self._hint(extra_info, pending, mode="copy") as request_id:
                         handle = self._runner.fetch(
                             pending,
                             request_id=request_id,
@@ -1074,6 +1206,22 @@ class KVCRStore(HiCacheStorage):
                     if not complete:
                         self._release_lookup_locked(scope)
                         return False
+                if self._is_move_hint(
+                    extra_info, [key for keys in windows.values() for key in keys]
+                ):
+                    expected = {
+                        block_key(key, self._namespace, name)
+                        for key in keys[:hit_pages]
+                        for name in set(self._layouts) - _TRAILING_POOLS
+                    }
+                    expected.update(
+                        key for pending in windows.values() for key in pending
+                    )
+                    self._move_scopes[scope] = {
+                        "claims": [],
+                        "delivered": set(),
+                        "expected": expected,
+                    }
                 return True
             except Exception:
                 if self._lookup_claims.get(scope) is claims:
