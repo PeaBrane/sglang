@@ -1016,6 +1016,50 @@ class TestKVCRStorage(CustomTestCase):
         self.assertFalse(transport.hints)
         self.assertEqual(len(transport.storage), 8)
 
+    def test_move_preserves_partial_pool_results_and_bytes(self):
+        backend, pools, transport, transfers, info, expected = self._move_fixture()
+        missing = block_key(self.keys[1], backend._namespace, str(PoolName.INDEXER))
+        del transport.peers["tcp://peer:32100"][missing]
+
+        result = backend.batch_get_v2(transfers, info)
+
+        self.assertEqual(
+            result, {"kv": [True] * 4, "indexer": [True, False, True, True]}
+        )
+        self.assertEqual(len(transport.storage), 7)
+        self.assertNotIn(missing, transport.storage)
+        self.assertFalse(transport.claims)
+        self.assertFalse(transport.hints)
+        for name, pool in pools.items():
+            indices = [0, 2, 3] if name == PoolName.INDEXER else [0, 1, 2, 3]
+            for actual, wanted in zip(pool.buffers, expected[name]):
+                self.assertTrue(torch.equal(actual[indices], wanted[indices]))
+        self.assertFalse(torch.count_nonzero(pools[PoolName.INDEXER].buffers[0][1]))
+
+    def test_move_releases_prior_claims_when_later_layout_fetch_fails(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture()
+        fetch = transport.fetch
+
+        def fail_second_fetch(*args, **kwargs):
+            if transport.fetches:
+                raise RuntimeError("second layout failed")
+            return fetch(*args, **kwargs)
+
+        with patch.object(transport, "fetch", side_effect=fail_second_fetch):
+            with self.assertRaisesRegex(RuntimeError, "second layout failed"):
+                backend.batch_get_v2(transfers, info)
+
+        self.assertEqual(len(transport.storage), 4)
+        self.assertFalse(transport.claims)
+        self.assertFalse(transport.hints)
+
+    def test_move_rejects_shared_mla_before_io(self):
+        config = copy.copy(self.config)
+        config.is_mla_model = True
+        config.extra_config = {"enable_move_hint": True, "share_replicated_mla": True}
+        with self.assertRaisesRegex(ValueError, "move hints do not support shared MLA"):
+            KVCRStore(config, self.pool)
+
     def test_move_hint_without_opt_in_never_reads_the_peer(self):
         backend, _, transport, transfers, info, _ = self._move_fixture(enabled=False)
         result = backend.batch_get_v2(transfers, info)
