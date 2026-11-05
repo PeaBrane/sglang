@@ -235,14 +235,37 @@ class _RetainedMoveTransport(_StrictPeerTransport):
         super().__init__(layouts, peers)
         self.fail_pool = None
         self.raise_pool = None
+        self.reject_keys = set()
         self.inventory = None
         self.on_move = None
+        self.invalidate_before_delivery = set()
+        self.pending_removal = set()
+
+    def deliver(self, blocks, request_id=None):
+        if request_id is None:
+            self.pending_removal.update(self.invalidate_before_delivery)
+            self.invalidate_before_delivery.clear()
+        handle = super().deliver(
+            {k: refs for k, refs in blocks.items() if k not in self.pending_removal},
+            request_id,
+        )
+        self.completed[handle].update(
+            {
+                k: SimpleNamespace(success=False)
+                for k in blocks
+                if k in self.pending_removal
+            }
+        )
+        return handle
 
     def fetch(self, keys, request_id=None, expected_layout=None):
         if any(key.decode().endswith("#" + str(self.raise_pool)) for key in keys):
             raise RuntimeError("pool fetch failed")
         accepted = [
-            k for k in keys if not k.decode().endswith("#" + str(self.fail_pool))
+            k
+            for k in keys
+            if k not in self.reject_keys
+            and not k.decode().endswith("#" + str(self.fail_pool))
         ]
         handle = super().fetch(accepted, request_id, expected_layout)
         result = self.completed[handle]
@@ -278,9 +301,13 @@ class _RetainedMoveTransport(_StrictPeerTransport):
             del self.storage[key]
 
     def release(self, handles):
-        return [
+        released = [
             (handle, self.claims.pop(handle, None) is not None) for handle in handles
         ]
+        for key in self.pending_removal - set(self.claims.values()):
+            self.storage.pop(key, None)
+        self.pending_removal.intersection_update(self.claims.values())
+        return released
 
 
 class _GatedFetchTransport(_StrictPeerTransport):
@@ -1060,11 +1087,79 @@ class TestKVCRStorage(CustomTestCase):
                     transport.fail_pool = "indexer"
                     self.assertEqual(
                         backend.batch_get_v2(transfers, info),
-                        {"kv": [True] * 4, "indexer": [False] * 4},
+                        {"kv": [True] * 4, "indexer": [True] * 4},
                     )
                 self.assertEqual(transport.peers["tcp://peer:32100"], source)
                 transport.evict_unclaimed()
                 self.assertFalse(transport.storage)
+
+    def test_move_capacity_fallback_delivers_without_invalidating_copied_pages(self):
+        backend, pools, transport, transfers, info, expected = self._move_fixture()
+        source = copy.deepcopy(transport.peers["tcp://peer:32100"])
+        copied_pages = set(self.keys[2:])
+        transport.reject_keys = {
+            key
+            for key in source
+            if key.split(b"#", 1)[0].decode() in copied_pages
+            and key.endswith(b"#indexer")
+        }
+        self.assertEqual(
+            backend.batch_get_v2(transfers, info),
+            {"kv": [True] * 4, "indexer": [True] * 4},
+        )
+        self.assertEqual(
+            transport.peers["tcp://peer:32100"],
+            {
+                key: data
+                for key, data in source.items()
+                if key.split(b"#", 1)[0].decode() in copied_pages
+            },
+        )
+        for name, pool in pools.items():
+            for actual, wanted in zip(pool.buffers, expected[name]):
+                self.assertTrue(torch.equal(actual[:4], wanted[:4]))
+        transport.evict_unclaimed()
+        self.assertFalse(transport.storage)
+
+    def test_hybrid_copy_fallback_blocks_scope_commit(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture(trailing=True)
+        info.extra_info["storage_lookup_scope"] = "restore-1"
+        source = copy.deepcopy(transport.peers["tcp://peer:32100"])
+        self.assertTrue(
+            backend.confirm_lookup(self.keys, transfers, 4, info, "restore-1")
+        )
+        transport.fail_pool = "indexer"
+        self.assertEqual(
+            backend.batch_get_v2(transfers, info),
+            {"kv": [True] * 4, "indexer": [True] * 4, "mamba": [True]},
+        )
+        # A later retry that can retain the missing pool cannot turn earlier
+        # host-only delivery into permission to invalidate the scope.
+        transport.fail_pool = None
+        backend.batch_get_v2(transfers[1:2], info)
+        self.assertEqual(transport.peers["tcp://peer:32100"], source)
+        backend.release_lookup("restore-1")
+        transport.evict_unclaimed()
+        self.assertFalse(transport.storage)
+
+    def test_reverse_move_copies_after_delayed_invalidation_rejects_local_delivery(
+        self,
+    ):
+        backend, pools, transport, transfers, info, expected = self._move_fixture()
+        source = copy.deepcopy(transport.peers["tcp://peer:32100"])
+        transport.invalidate_before_delivery = {
+            key for key in source if key.endswith(b"#kv")
+        }
+        self.assertEqual(
+            backend.batch_get_v2(transfers, info),
+            {"kv": [True] * 4, "indexer": [True] * 4},
+        )
+        self.assertEqual(transport.peers["tcp://peer:32100"], source)
+        for name, pool in pools.items():
+            for actual, wanted in zip(pool.buffers, expected[name]):
+                self.assertTrue(torch.equal(actual[:4], wanted[:4]))
+        transport.evict_unclaimed()
+        self.assertFalse(transport.storage)
 
     def test_hybrid_move_waits_for_kv_indexer_and_checkpoint_delivery(self):
         backend, _, transport, transfers, info, _ = self._move_fixture(trailing=True)

@@ -493,7 +493,7 @@ class KVCRStore(HiCacheStorage):
         by_layout = {}
         for key, refs in blocks.items():
             by_layout.setdefault(tuple(ref.label for ref in refs), []).append(key)
-        claims, fetched = [], {}
+        claims, fetched, fetched_claims = [], {}, {}
         try:
             with self._hint(extra_info, blocks, mode="copy") as request_id:
                 for labels, keys in by_layout.items():
@@ -510,12 +510,30 @@ class KVCRStore(HiCacheStorage):
                             continue
                         claims.append(entry.release_handle)
                         fetched[key] = blocks[key]
-            if not fetched:
-                self._log_move(extra_info, blocks, {}, set())
-                return None, {}
-            handle = self._runner.deliver(fetched)
-            result = self._wait(handle)
+                        fetched_claims[key] = entry.release_handle
+            handle, result = None, {}
+            if fetched:
+                handle = self._runner.deliver(fetched)
+                result = self._wait(handle)
             delivered = {key for key, entry in result.items() if entry.success}
+            failed_claims = {
+                claim for key, claim in fetched_claims.items() if key not in delivered
+            }
+            if failed_claims:
+                # An invalidation can arrive between fetch and local delivery.
+                # Release terminal failures so our claims cannot stall its drain.
+                self._release_claim_handles(list(failed_claims))
+                claims = [claim for claim in claims if claim not in failed_claims]
+            fallback = {
+                key: refs for key, refs in blocks.items() if key not in delivered
+            }
+            if fallback:
+                # Direct delivery needs no receiver KVCR slot. These host-only
+                # copies cannot authorize invalidation, including in later batches.
+                state["copy_only"] = True
+                with self._hint(extra_info, fallback, mode="copy") as request_id:
+                    handle = self._runner.deliver(fallback, request_id=request_id)
+                    result.update(self._wait(handle))
             # A wait unlocks the adapter: cancellation may have released this
             # operation while its copy was in flight. Never commit a dead scope.
             if scoped and self._move_scopes.get(scope) is not state:
@@ -525,7 +543,9 @@ class KVCRStore(HiCacheStorage):
             state["claims"].extend(claims)
             claims = []
             if scoped:
-                ready = state["expected"].issubset(state["delivered"])
+                ready = not state.get("copy_only") and state["expected"].issubset(
+                    state["delivered"]
+                )
                 complete = state["expected"] if ready else set()
             else:
                 pools = set(self._layouts) - _TRAILING_POOLS

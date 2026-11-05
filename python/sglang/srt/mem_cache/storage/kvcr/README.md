@@ -68,11 +68,23 @@ KVCR storage and holds its claims through local host-page delivery. Only pages
 complete in every required pool of this rank are re-fetched with move advice.
 Those pinned local hits request source invalidation; the receiver releases the
 claims afterward and keeps the cached data. Move enables combined KV/indexer
-reads even when `combine_page_reads` is false. Hybrid restores hold copies under
+reads even when `combine_page_reads` is false. Keys the receiver cannot retain or
+deliver locally fall back to ordinary copy delivery into the same host pages,
+without invalidation. Terminal local-delivery failures release their fetch claims
+first, allowing a delayed invalidation to drain before the copy retry.
+Capacity rejection therefore does not reduce restore coverage relative to a copy
+read with the same source availability. KVCR `419ac8b` rejects both fetch and
+direct delivery while a receiver key is pending removal; fallback cannot bypass
+that barrier if another operation still holds it. A page moves only if every required component was retained and
+delivered.
+Hybrid restores hold copies under
 the controller's operation scope across KV batches and trailing-state delivery;
 they invalidate only after the confirmed prefix and checkpoints are all local.
 Cancellation, scope replacement and errors release the held claims. Trailing
 pools without a confirmed operation scope use copy-only behavior.
+A scoped restore that uses copy fallback stays copy-only for the entire scope.
+If the controller trims an already-confirmed prefix head, the scope still expects
+that head and safely leaves the source intact; trimmed scopes do not commit moves.
 
 TP and CP ranks move independently. If ranks diverge, a logical KVCR page can become
 unusable on both workers even though each moved shard reached its destination.
