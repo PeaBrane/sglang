@@ -227,6 +227,28 @@ class _StrictPeerTransport(_CopyTransport):
         return released
 
 
+class _RetainedMoveTransport(_StrictPeerTransport):
+    """Model KVCR retention and claim lifetimes at the dependency boundary."""
+
+    def __init__(self, layouts, peers):
+        super().__init__(layouts, peers)
+        self.fetch_layouts = []
+
+    def fetch(self, keys, request_id=None, expected_layout=None):
+        self.fetch_layouts.append(tuple(expected_layout or ()))
+        return super().fetch(keys, request_id, expected_layout)
+
+    def deliver(self, blocks, request_id=None):
+        if not (set(blocks) & self.storage.keys()).issubset(self.claims.values()):
+            raise AssertionError("move delivery lost its fetch claims")
+        return super().deliver(blocks, request_id)
+
+    def release(self, handles):
+        return [
+            (handle, self.claims.pop(handle, None) is not None) for handle in handles
+        ]
+
+
 class _GatedFetchTransport(_StrictPeerTransport):
     """Delay one dependency completion while the real adapter waits unlocked."""
 
@@ -911,6 +933,96 @@ class TestKVCRStorage(CustomTestCase):
         for name, pool in destination_pools.items():
             for prior, actual in zip(before[name], pool.buffers):
                 self.assertTrue(torch.equal(prior, actual))
+
+    def _move_fixture(self, enabled=True):
+        config = copy.copy(self.config)
+        config.extra_config = {"enable_move_hint": enabled}
+        pools = {PoolName.KV: _HostPool(), PoolName.INDEXER: _HostPool(sizes=(5,))}
+        backend = KVCRStore(config, pools[PoolName.KV])
+        backend.register_mem_host_pool_v2(pools[PoolName.INDEXER], PoolName.INDEXER)
+        backend._namespace = storage_namespace(config, backend._layouts)
+        source = _CopyTransport(backend._layouts)
+        backend._runner = source
+        for pool_index, pool in enumerate(pools.values()):
+            for part, buffer in enumerate(pool.buffers):
+                buffer.copy_(
+                    torch.arange(buffer.numel()).reshape_as(buffer)
+                    + 17 * pool_index
+                    + part
+                )
+        transfers = [
+            PoolTransfer(name, keys=self.keys, host_indices=torch.arange(8))
+            for name in pools
+        ]
+        backend.batch_set_v2(transfers)
+        expected = {
+            name: [b.clone() for b in pool.buffers] for name, pool in pools.items()
+        }
+        for pool in pools.values():
+            for buffer in pool.buffers:
+                buffer.zero_()
+        transport = backend._runner = _RetainedMoveTransport(
+            backend._layouts, {"tcp://peer:32100": source.storage}
+        )
+        info = HiCacheStorageExtraInfo(
+            extra_info={
+                "kv_hints": {
+                    "protocol_version": "0.1",
+                    "actions": [
+                        {
+                            "action_type": "kv.fetch",
+                            "action_version": "1.0",
+                            "payload": {
+                                "source_control_endpoint": "tcp://peer:32100",
+                                "mode": "move",
+                                "block_hashes": [
+                                    int(key[:16], 16) for key in self.keys
+                                ],
+                            },
+                        }
+                    ],
+                }
+            }
+        )
+        return backend, pools, transport, transfers, info, expected
+
+    def test_move_fetches_each_layout_before_claimed_local_delivery(self):
+        backend, pools, transport, transfers, info, expected = self._move_fixture()
+        result = backend.batch_get_v2(transfers, info)
+        self.assertEqual(result, {"kv": [True] * 4, "indexer": [True] * 4})
+        self.assertEqual(
+            set(transport.fetch_layouts),
+            {
+                tuple(part.name for part in layout.components)
+                for layout in backend._layouts.values()
+            },
+        )
+        self.assertEqual(len(transport.fetches), 2)
+        self.assertEqual(len(transport.storage), 8)
+        self.assertFalse(transport.claims)
+        self.assertFalse(transport.hints)
+        for name, pool in pools.items():
+            for actual, wanted in zip(pool.buffers, expected[name]):
+                self.assertTrue(torch.equal(actual[:4], wanted[:4]))
+
+    def test_move_releases_all_fetch_claims_when_local_delivery_fails(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture()
+        with patch.object(
+            transport, "deliver", side_effect=RuntimeError("delivery failed")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "delivery failed"):
+                backend.batch_get_v2(transfers, info)
+        self.assertFalse(transport.claims)
+        self.assertFalse(transport.hints)
+        self.assertEqual(len(transport.storage), 8)
+
+    def test_move_hint_without_opt_in_never_reads_the_peer(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture(enabled=False)
+        result = backend.batch_get_v2(transfers, info)
+        self.assertEqual(result, {"kv": [False] * 4, "indexer": [False] * 4})
+        self.assertFalse(transport.fetches)
+        self.assertFalse(transport.storage)
+        self.assertFalse(transport.hints)
 
     def test_advisory_mamba_hint_requires_source_checkpoint_and_held_copy(self):
         """A logical-page hint must not admit absent Mamba, and a confirmed

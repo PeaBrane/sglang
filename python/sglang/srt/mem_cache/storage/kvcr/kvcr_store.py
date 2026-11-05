@@ -729,7 +729,9 @@ class KVCRStore(HiCacheStorage):
                                 "direction": (
                                     "deposit"
                                     if is_set
-                                    else "move" if move else "deliver"
+                                    else "move"
+                                    if move
+                                    else "deliver"
                                 ),
                                 "source": (
                                     self._operation_hint(extra_info, blocks)["actions"][

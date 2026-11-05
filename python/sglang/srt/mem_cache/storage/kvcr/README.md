@@ -61,6 +61,18 @@ provided by the companion in-process Dynamo SGLang integration. A query is
 advisory; terminal delivery determines which pages are usable. Missing hints
 do not authorize fetching from an unrelated replica.
 
+Move hints require `"enable_move_hint": true` and a KVCR version that supports
+move advice (tested against KVCR revision `419ac8b`). The default remains copy.
+A move fetches each physical layout into the receiver's KVCR storage, holds its
+claims through the local host-page delivery, then releases the claims while the
+stored copy remains cached. Shared replicated MLA storage is unsupported for
+move because another rank may still need the source pages.
+
+In that KVCR revision, the source removes eligible G2 data after its own native
+write succeeds, without destination confirmation. A sufficiently delayed
+destination can therefore fail after source removal. The adapter does not
+strengthen that contract or provide a framework-wide stale-GPU relinquish guard.
+
 For backend-owned routing inventory, opt in with `"publish_inventory": true`
 in the backend extra configuration and configure a ZMQ KV-event publisher
 with `"format": "dynamo"` when using Dynamo routing.
