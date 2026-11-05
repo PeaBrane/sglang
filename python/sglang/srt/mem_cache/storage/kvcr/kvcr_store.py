@@ -154,6 +154,7 @@ class KVCRStore(HiCacheStorage):
 
             self._metrics = StorageMetrics()
         self._verify_transfer_bytes = _bool_option(self._extra, "verify_transfer_bytes")
+        self._enable_move_hint = _bool_option(self._extra, "enable_move_hint")
         self._align_storage_prefix = _bool_option(self._extra, "align_storage_prefix")
         self._diagnostic_telemetry = _bool_option(self._extra, "diagnostic_telemetry")
         self.supports_combined_page_reads = _bool_option(
@@ -175,6 +176,10 @@ class KVCRStore(HiCacheStorage):
             raise ValueError(
                 "Shared MLA storage requires replicated physical KV, CP=1 and PP=1"
             )
+        if self._enable_move_hint and self._share_replicated_mla:
+            # Every TP rank reads TP0's one copy; a move by one rank would
+            # remove pages the other ranks still have to read.
+            raise ValueError("KVCR move hints do not support shared MLA storage")
         # Shared mode is an explicit claim that KV/indexer bytes are identical
         # across attention TP ranks. Never apply it to sharded hybrid state.
         self.requires_rank_local_backup = not self._share_replicated_mla
@@ -415,7 +420,12 @@ class KVCRStore(HiCacheStorage):
 
     def _operation_hint(self, extra_info, keys=None):
         hint = (
-            peer_hint(extra_info, self._source_offset, keys)
+            peer_hint(
+                extra_info,
+                self._source_offset,
+                keys,
+                allow_move=self._enable_move_hint,
+            )
             if self._extra.get("enable_remote_hint", True)
             else None
         )
@@ -459,6 +469,44 @@ class KVCRStore(HiCacheStorage):
         finally:
             if request_id is not None:
                 self._runner.discard_hint(request_id)
+
+    def _is_move_hint(self, extra_info, keys):
+        hint = self._operation_hint(extra_info, keys)
+        return hint is not None and hint["actions"][0]["payload"]["mode"] == "move"
+
+    def _move_read(self, blocks, request_id):
+        """Retain move pages in this KVCR, then copy them into host pages.
+
+        KVCR deliver always copies; only fetch keeps a destination copy and
+        lets the source drop its own. The fetch claims pin that copy until the
+        local delivery has finished.
+        """
+        by_layout = {}
+        for key, refs in blocks.items():
+            by_layout.setdefault(tuple(ref.label for ref in refs), []).append(key)
+        claims, fetched = [], {}
+        try:
+            for labels, keys in by_layout.items():
+                result = self._wait(
+                    self._runner.fetch(
+                        keys, request_id=request_id, expected_layout=list(labels)
+                    )
+                )
+                for key in keys:
+                    entry = result.get(key)
+                    if entry is None or not entry.success:
+                        continue
+                    if entry.release_handle is None:
+                        continue
+                    claims.append(entry.release_handle)
+                    fetched[key] = blocks[key]
+            if not fetched:
+                return None, {}
+            handle = self._runner.deliver(fetched)
+            return handle, self._wait(handle)
+        finally:
+            if claims:
+                self._release_claim_handles(claims)
 
     def _wait(self, handle):
         # There can be concurrent backup and prefetch threads. One caller may
@@ -648,14 +696,24 @@ class KVCRStore(HiCacheStorage):
                 self._hint(extra_info, keys=None if is_set else blocks) as request_id,
             ):
                 prepared = time.perf_counter() if diagnostic else None
-                handle = (
-                    self._runner.deposit(blocks)
-                    if is_set
-                    else self._runner.deliver(blocks, request_id=request_id)
+                move = (
+                    not is_set
+                    and request_id is not None
+                    and self._is_move_hint(extra_info, blocks)
                 )
-                submitted = time.perf_counter() if diagnostic else None
-                # _wait releases the condition's recursive lock while sleeping.
-                result = self._wait(handle)
+                if move:
+                    # Both the fetch and the local delivery wait in here.
+                    handle, result = self._move_read(blocks, request_id)
+                    submitted = time.perf_counter() if diagnostic else None
+                else:
+                    handle = (
+                        self._runner.deposit(blocks)
+                        if is_set
+                        else self._runner.deliver(blocks, request_id=request_id)
+                    )
+                    submitted = time.perf_counter() if diagnostic else None
+                    # _wait releases the condition's recursive lock while sleeping.
+                    result = self._wait(handle)
                 finished = time.perf_counter() if diagnostic else None
                 if diagnostic:
                     logger.info(
@@ -668,7 +726,11 @@ class KVCRStore(HiCacheStorage):
                                 "endpoint": self._control_endpoint,
                                 "operation": handle,
                                 "stage": "primary",
-                                "direction": "deposit" if is_set else "deliver",
+                                "direction": (
+                                    "deposit"
+                                    if is_set
+                                    else "move" if move else "deliver"
+                                ),
                                 "source": (
                                     self._operation_hint(extra_info, blocks)["actions"][
                                         0
