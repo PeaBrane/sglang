@@ -68,6 +68,11 @@ claims through the local host-page delivery, then releases the claims while the
 stored copy remains cached. Shared replicated MLA storage is unsupported for
 move because another rank may still need the source pages.
 
+Move applies to KVCR-owned host storage. Source GPU and HiCache cache entries
+remain governed by SGLang's existing cache policy; this option neither evicts
+them nor marks them relinquished. A later framework backup can recreate the
+source's KVCR copy.
+
 In that KVCR revision, the source removes eligible G2 data after its own native
 write succeeds, without destination confirmation. A sufficiently delayed
 destination can therefore fail after source removal. The adapter does not
