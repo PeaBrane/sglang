@@ -1109,6 +1109,7 @@ class TestKVCRStorage(CustomTestCase):
         backend, pools, transport, transfers, info, expected = self._move_fixture()
         result = backend.batch_get_v2(transfers, info)
         self.assertEqual(result, {"kv": [True] * 4, "indexer": [True] * 4})
+        backend._reap_background()
         self.assertFalse(transport.peers["tcp://peer:32100"])
         self.assertEqual(backend.batch_exists(self.keys), 4)
         for name, pool in pools.items():
@@ -1164,6 +1165,7 @@ class TestKVCRStorage(CustomTestCase):
                     backend.batch_get_v2(transfers, info),
                     {"kv": [True] * 4, "indexer": [True] * 4},
                 )
+                backend._reap_background()
                 self.assertEqual(transport.peers["tcp://peer:32100"], source)
                 transport.evict_unclaimed()
                 self.assertFalse(transport.storage)
@@ -1182,6 +1184,7 @@ class TestKVCRStorage(CustomTestCase):
             backend.batch_get_v2(transfers, info),
             {"kv": [True] * 4, "indexer": [True] * 4},
         )
+        backend._reap_background()
         self.assertEqual(
             transport.peers["tcp://peer:32100"],
             {
@@ -1210,8 +1213,11 @@ class TestKVCRStorage(CustomTestCase):
         )
         # A later retry that can retain the missing pool cannot turn an earlier
         # failed retention into permission to invalidate the scope.
+        backend.release_lookup("restore-1")
+        backend._reap_background()
         transport.fail_pool = None
         backend.batch_get_v2(transfers[1:2], info)
+        backend._reap_background()
         self.assertEqual(transport.peers["tcp://peer:32100"], source)
         backend.release_lookup("restore-1")
         transport.evict_unclaimed()
@@ -1227,6 +1233,7 @@ class TestKVCRStorage(CustomTestCase):
             backend.batch_get_v2(transfers, info),
             {"kv": [True] * 4, "indexer": [True] * 4},
         )
+        backend._reap_background()
         self.assertEqual(transport.peers["tcp://peer:32100"], source)
         for name, pool in pools.items():
             for actual, wanted in zip(pool.buffers, expected[name]):
@@ -1249,8 +1256,11 @@ class TestKVCRStorage(CustomTestCase):
         )
         self.assertEqual(transport.peers["tcp://peer:32100"], source)
         self.assertEqual(backend.batch_get_v2(transfers[2:], info), {"mamba": [True]})
-        self.assertFalse(transport.peers["tcp://peer:32100"])
+        backend._reap_background()
+        self.assertEqual(transport.peers["tcp://peer:32100"], source)
         backend.release_lookup("restore-1")
+        backend._reap_background()
+        self.assertFalse(transport.peers["tcp://peer:32100"])
 
     def test_cancelled_hybrid_move_preserves_source(self):
         backend, _, transport, transfers, info, _ = self._move_fixture(trailing=True)
@@ -1261,6 +1271,7 @@ class TestKVCRStorage(CustomTestCase):
         )
         backend.batch_get_v2(transfers[:2], info)
         backend.release_lookup("restore-1")
+        backend._reap_background()
         self.assertEqual(transport.peers["tcp://peer:32100"], source)
         transport.evict_unclaimed()
         self.assertFalse(transport.storage)
@@ -1279,11 +1290,12 @@ class TestKVCRStorage(CustomTestCase):
             backend.batch_get_v2(transfers[1:2], info), {"indexer": [True] * 4}
         )
         backend.release_lookup("restore-1")
+        backend._reap_background()
         transport.evict_unclaimed()
         self.assertFalse(transport.storage)
         self.assertEqual(transport.peers["tcp://peer:32100"], source)
 
-    def test_cancellation_during_invalidation_keeps_all_destination_pools_pinned(self):
+    def test_pressure_during_invalidation_keeps_all_destination_pools_pinned(self):
         backend, _, transport, transfers, info, _ = self._move_fixture(trailing=True)
         info.extra_info["storage_lookup_scope"] = "restore-1"
         self.assertTrue(
@@ -1297,6 +1309,8 @@ class TestKVCRStorage(CustomTestCase):
 
         transport.on_move = cancel_and_apply_pressure
         self.assertEqual(backend.batch_get_v2(transfers[2:], info), {"mamba": [True]})
+        backend.release_lookup("restore-1")
+        backend._reap_background()
         self.assertFalse(transport.peers["tcp://peer:32100"])
         self.assertEqual(backend.batch_exists_v2(self.keys, transfers).kv_hit_pages, 4)
         transport.evict_unclaimed()
@@ -1324,6 +1338,7 @@ class TestKVCRStorage(CustomTestCase):
                     for i, key in enumerate(self.keys)
                 }
                 backend.batch_get_v2(transfers, info)
+                backend._reap_background()
                 events = backend.take_kv_events()
                 self.assertEqual(len(events), count)
                 self.assertTrue(all(event.ownership == "kvcr" for event in events))
@@ -1358,6 +1373,7 @@ class TestKVCRStorage(CustomTestCase):
                     backend.batch_get_v2(transfers, info),
                     {"kv": [True] * 4, "indexer": [True] * 4},
                 )
+                backend._reap_background()
                 self.assertEqual(len(transport.peers["tcp://peer:32100"]), 8)
                 self.assertFalse(transport.moves)
                 self.assertFalse(transport.claims)
@@ -1390,6 +1406,10 @@ class TestKVCRStorage(CustomTestCase):
             {"kv": [True] * 4, "indexer": [True] * 4},
         )
         self.assertEqual(calls[0], ("deliver", True))
+        self.assertEqual(calls, [("deliver", True)])
+        self.assertFalse(transport.held)
+        self.assertFalse(transport.claims)
+        backend._reap_background()
         self.assertEqual(calls[1:], [("fetch", None, "tcp://peer:32100")] * 2)
         # The read returned while both retention fetches are still in flight.
         self.assertEqual(len(transport.held), 2)
@@ -1423,6 +1443,8 @@ class TestKVCRStorage(CustomTestCase):
         self.assertEqual(transport.peers["tcp://peer:32100"], source)
         self.assertFalse(transport.moves)
         self.assertFalse(backend.take_kv_events())
+        backend._reap_background()
+        self.assertFalse(backend.take_kv_events())
         transport.finish_follows()
         backend._reap_background()
         self.assertEqual(len(backend.take_kv_events()), 4)
@@ -1443,12 +1465,118 @@ class TestKVCRStorage(CustomTestCase):
         transport.evict_unclaimed()
         self.assertTrue(any(key.endswith(b"#mamba") for key in transport.storage))
         self.assertTrue(transport.peers["tcp://peer:32100"])
+        backend._reap_background()
         transport.finish_follows()
         backend._reap_background()
         self.assertFalse(transport.peers["tcp://peer:32100"])
         self.assertEqual(backend.batch_exists_v2(self.keys, transfers).kv_hit_pages, 4)
         transport.evict_unclaimed()
         self.assertFalse(transport.storage)
+
+    def test_hybrid_retention_queues_until_release_and_keeps_checkpoint_pinned(self):
+        for move in (False, True):
+            with self.subTest(move=move):
+                backend, _, transport, transfers, info, _ = self._move_fixture(
+                    trailing=True, retain=True, publish=True
+                )
+                info.extra_info["kv_hints"]["actions"][0]["payload"]["mode"] = (
+                    "move" if move else "copy"
+                )
+                info.extra_info["storage_lookup_scope"] = "restore-1"
+                self.assertTrue(
+                    backend.confirm_lookup(self.keys, transfers, 4, info, "restore-1")
+                )
+                transport.hold_follows = True
+                calls = []
+                fetch = transport.fetch
+
+                def tracked_fetch(*args, **kwargs):
+                    calls.append(kwargs.get("source_endpoint"))
+                    return fetch(*args, **kwargs)
+
+                transport.fetch = tracked_fetch
+                backend.batch_get_v2(transfers, info)
+                state = backend._move_scopes["restore-1"]
+                self.assertEqual(state.queued, 3)
+                self.assertFalse(state.pending)
+                self.assertEqual(len(state.registrations), 1)
+                backend._reap_background()
+                self.assertFalse(calls)
+                backend.release_lookup("restore-1")
+                self.assertTrue(state.claims)
+                self.assertEqual(state.queued, 3)
+                transport.evict_unclaimed()
+                self.assertTrue(
+                    any(key.endswith(b"#mamba") for key in transport.storage)
+                )
+                backend._reap_background()
+                self.assertEqual(calls, ["tcp://peer:32100"] * 3)
+                self.assertFalse(state.queued)
+                self.assertEqual(len(state.pending), 3)
+                transport.finish_follows()
+                backend._reap_background()
+                self.assertTrue(state.settled)
+                self.assertFalse(state.claims)
+                self.assertFalse(state.registrations)
+                self.assertEqual(
+                    len(transport.peers["tcp://peer:32100"]), 0 if move else 9
+                )
+
+    def test_close_cancels_queued_hybrid_retention_and_releases_claims(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture(
+            trailing=True, publish=True
+        )
+        info.extra_info["storage_lookup_scope"] = "restore-1"
+        info.extra_info["kv_event_metadata"] = {
+            key: BlockStored(
+                block_hashes=[17 + i],
+                parent_block_hash=None,
+                token_ids=[2 * i, 2 * i + 1],
+                block_size=2,
+                lora_id=None,
+            )
+            for i, key in enumerate(self.keys)
+        }
+        source = copy.deepcopy(transport.peers["tcp://peer:32100"])
+        self.assertTrue(
+            backend.confirm_lookup(self.keys, transfers, 4, info, "restore-1")
+        )
+        backend.batch_get_v2(transfers, info)
+        state = backend._move_scopes["restore-1"]
+        self.assertEqual(state.queued, 3)
+        self.assertTrue(transport.claims)
+        self.assertTrue(backend._inventory._pending)
+        with (
+            patch.object(transport, "fetch", wraps=transport.fetch) as fetch,
+            patch.object(transport, "close", create=True) as close,
+        ):
+            backend.close()
+        fetch.assert_not_called()
+        close.assert_called_once_with()
+        self.assertFalse(backend._follow_queue)
+        self.assertFalse(transport.claims)
+        self.assertFalse(backend._lookup_claims)
+        self.assertFalse(backend._inventory._pending)
+        self.assertFalse(state.registrations)
+        self.assertTrue(state.settled)
+        self.assertTrue(state.failed)
+        self.assertEqual(transport.peers["tcp://peer:32100"], source)
+        self.assertFalse(transport.moves)
+
+    def test_foreground_wait_does_not_submit_or_settle_retention(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture()
+        backend.batch_get_v2(transfers, info)
+        self.assertTrue(backend._follow_queue)
+        with (
+            patch.object(backend, "_submit_follows_locked") as submit,
+            patch.object(backend, "_reap_background_locked") as reap,
+        ):
+            backend.batch_get_v2(transfers, info)
+        submit.assert_not_called()
+        reap.assert_not_called()
+        self.assertFalse(transport.moves)
+        backend._reap_background()
+        self.assertFalse(transport.claims)
 
     def test_move_invalidates_through_the_named_source_without_waiting(self):
         backend, _, transport, transfers, info, _ = self._move_fixture()
@@ -1476,6 +1604,7 @@ class TestKVCRStorage(CustomTestCase):
             backend.batch_get_v2(transfers, info),
             {"kv": [True] * 4, "indexer": [True] * 4},
         )
+        backend._reap_background()
         self.assertNotIn("forced", polls)
         self.assertEqual(
             [(source, request_id) for source, _, request_id in transport.moves],
