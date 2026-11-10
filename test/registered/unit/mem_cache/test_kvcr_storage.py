@@ -241,6 +241,23 @@ class _RetainedMoveTransport(_StrictPeerTransport):
         self.invalidate_before_delivery = set()
         self.pending_removal = set()
         self.moves = []
+        self.named_source = None
+        # Background retention completions withheld until finish_follows().
+        self.hold_follows = False
+        self.held = {}
+
+    def _authorized(self, request_id):
+        if request_id is None and self.named_source is not None:
+            # A named-source fetch reads the source's KVCR without a request hint.
+            return dict(self.peers.get(self.named_source, {}))
+        return super()._authorized(request_id)
+
+    def finish_follows(self):
+        for handle, (result, successful) in self.held.items():
+            self.completed[handle] = result
+            if self.inventory is not None:
+                self.inventory.update(SimpleNamespace(keys=successful, removed=False))
+        self.held.clear()
 
     def deliver(self, blocks, request_id=None):
         if request_id is None:
@@ -270,13 +287,23 @@ class _RetainedMoveTransport(_StrictPeerTransport):
     ):
         if any(key.decode().endswith("#" + str(self.raise_pool)) for key in keys):
             raise RuntimeError("pool fetch failed")
+        follow = source_endpoint is not None and not move
+        if follow:
+            # A reverse move can mark receiver keys for removal before retention.
+            self.pending_removal.update(self.invalidate_before_delivery)
+            self.invalidate_before_delivery.clear()
         accepted = [
             k
             for k in keys
             if k not in self.reject_keys
+            and k not in self.pending_removal
             and not k.decode().endswith("#" + str(self.fail_pool))
         ]
-        handle = super().fetch(accepted, request_id, expected_layout)
+        self.named_source = source_endpoint
+        try:
+            handle = super().fetch(accepted, request_id, expected_layout)
+        finally:
+            self.named_source = None
         result = self.completed[handle]
         result.update(
             {
@@ -286,6 +313,9 @@ class _RetainedMoveTransport(_StrictPeerTransport):
             }
         )
         successful = [key for key, entry in result.items() if entry.success]
+        if follow and self.hold_follows:
+            self.held[handle] = (self.completed.pop(handle), successful)
+            return handle
         if self.inventory is not None:
             self.inventory.update(SimpleNamespace(keys=successful, removed=False))
         if move:
@@ -1127,14 +1157,13 @@ class TestKVCRStorage(CustomTestCase):
                 source = copy.deepcopy(transport.peers["tcp://peer:32100"])
                 if raises:
                     transport.raise_pool = "indexer"
-                    with self.assertRaisesRegex(RuntimeError, "pool fetch failed"):
-                        backend.batch_get_v2(transfers, info)
                 else:
                     transport.fail_pool = "indexer"
-                    self.assertEqual(
-                        backend.batch_get_v2(transfers, info),
-                        {"kv": [True] * 4, "indexer": [True] * 4},
-                    )
+                # The read took copy's path; failed retention only keeps the source.
+                self.assertEqual(
+                    backend.batch_get_v2(transfers, info),
+                    {"kv": [True] * 4, "indexer": [True] * 4},
+                )
                 self.assertEqual(transport.peers["tcp://peer:32100"], source)
                 transport.evict_unclaimed()
                 self.assertFalse(transport.storage)
@@ -1179,8 +1208,8 @@ class TestKVCRStorage(CustomTestCase):
             backend.batch_get_v2(transfers, info),
             {"kv": [True] * 4, "indexer": [True] * 4, "mamba": [True]},
         )
-        # A later retry that can retain the missing pool cannot turn earlier
-        # host-only delivery into permission to invalidate the scope.
+        # A later retry that can retain the missing pool cannot turn an earlier
+        # failed retention into permission to invalidate the scope.
         transport.fail_pool = None
         backend.batch_get_v2(transfers[1:2], info)
         self.assertEqual(transport.peers["tcp://peer:32100"], source)
@@ -1188,9 +1217,7 @@ class TestKVCRStorage(CustomTestCase):
         transport.evict_unclaimed()
         self.assertFalse(transport.storage)
 
-    def test_reverse_move_copies_after_delayed_invalidation_rejects_local_delivery(
-        self,
-    ):
+    def test_reverse_move_before_retention_keeps_the_source(self):
         backend, pools, transport, transfers, info, expected = self._move_fixture()
         source = copy.deepcopy(transport.peers["tcp://peer:32100"])
         transport.invalidate_before_delivery = {
@@ -1248,8 +1275,10 @@ class TestKVCRStorage(CustomTestCase):
             )
             backend.batch_get_v2(transfers[:1], info)
         transport.raise_pool = "indexer"
-        with self.assertRaisesRegex(RuntimeError, "pool fetch failed"):
-            backend.batch_get_v2(transfers[1:2], info)
+        self.assertEqual(
+            backend.batch_get_v2(transfers[1:2], info), {"indexer": [True] * 4}
+        )
+        backend.release_lookup("restore-1")
         transport.evict_unclaimed()
         self.assertFalse(transport.storage)
         self.assertEqual(transport.peers["tcp://peer:32100"], source)
@@ -1337,37 +1366,89 @@ class TestKVCRStorage(CustomTestCase):
                     for actual, wanted in zip(pool.buffers, expected[name]):
                         self.assertTrue(torch.equal(actual[:4], wanted[:4]))
 
-    def test_retained_read_submits_local_delivery_before_waiting(self):
-        """Fetches and the local delivery overlap; the read waits once."""
+    def test_retained_read_takes_the_copy_path_and_retains_in_the_background(self):
+        """The read is one hinted copy delivery; retention follows, unawaited."""
         backend, _, transport, transfers, info, _ = self._move_fixture(
             enabled=False, retain=True
         )
         info.extra_info["kv_hints"]["actions"][0]["payload"]["mode"] = "copy"
-        order = []
-        fetch, deliver, poll = (
-            transport.fetch,
-            transport.deliver,
-            transport.poll_completed,
-        )
+        transport.hold_follows = True
+        calls = []
+        fetch, deliver = transport.fetch, transport.deliver
 
-        def tracked_fetch(*args, **kwargs):
-            order.append("fetch")
-            return fetch(*args, **kwargs)
+        def tracked_fetch(keys, request_id=None, expected_layout=None, **kwargs):
+            calls.append(("fetch", request_id, kwargs.get("source_endpoint")))
+            return fetch(keys, request_id, expected_layout, **kwargs)
 
         def tracked_deliver(blocks, request_id=None):
-            order.append("deliver" if request_id is None else "copy")
+            calls.append(("deliver", request_id is not None))
             return deliver(blocks, request_id)
 
-        def tracked_poll():
-            order.append("poll")
-            return poll()
+        transport.fetch, transport.deliver = tracked_fetch, tracked_deliver
+        self.assertEqual(
+            backend.batch_get_v2(transfers, info),
+            {"kv": [True] * 4, "indexer": [True] * 4},
+        )
+        self.assertEqual(calls[0], ("deliver", True))
+        self.assertEqual(calls[1:], [("fetch", None, "tcp://peer:32100")] * 2)
+        # The read returned while both retention fetches are still in flight.
+        self.assertEqual(len(transport.held), 2)
+        self.assertTrue(transport.claims)
+        transport.finish_follows()
+        backend._reap_background()
+        self.assertFalse(transport.claims)
+        self.assertEqual(len(transport.storage), 8)
+        self.assertEqual(len(transport.peers["tcp://peer:32100"]), 8)
 
-        transport.fetch = tracked_fetch
-        transport.deliver = tracked_deliver
-        transport.poll_completed = tracked_poll
+    def test_move_keeps_the_source_until_retention_lands(self):
+        """Neither invalidation nor a destination Stored event precedes the
+        background fetch; the event metadata outlives the read until then."""
+        backend, _, transport, transfers, info, _ = self._move_fixture(publish=True)
+        info.extra_info["kv_event_metadata"] = {
+            key: BlockStored(
+                block_hashes=[17 + i],
+                parent_block_hash=None,
+                token_ids=[2 * i, 2 * i + 1],
+                block_size=2,
+                lora_id=None,
+            )
+            for i, key in enumerate(self.keys)
+        }
+        transport.hold_follows = True
+        source = copy.deepcopy(transport.peers["tcp://peer:32100"])
+        self.assertEqual(
+            backend.batch_get_v2(transfers, info),
+            {"kv": [True] * 4, "indexer": [True] * 4},
+        )
+        self.assertEqual(transport.peers["tcp://peer:32100"], source)
+        self.assertFalse(transport.moves)
+        self.assertFalse(backend.take_kv_events())
+        transport.finish_follows()
+        backend._reap_background()
+        self.assertEqual(len(backend.take_kv_events()), 4)
+        self.assertFalse(transport.peers["tcp://peer:32100"])
+        self.assertFalse(transport.claims)
+
+    def test_hybrid_move_released_before_retention_keeps_the_checkpoint_pinned(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture(trailing=True)
+        info.extra_info["storage_lookup_scope"] = "restore-1"
+        self.assertTrue(
+            backend.confirm_lookup(self.keys, transfers, 4, info, "restore-1")
+        )
+        transport.hold_follows = True
         backend.batch_get_v2(transfers, info)
-        self.assertEqual(order[:3], ["fetch", "fetch", "deliver"])
-        self.assertNotIn("copy", order)
+        backend.release_lookup("restore-1")
+        # Pressure while retention is in flight must not take the checkpoint
+        # the source is about to be asked to drop.
+        transport.evict_unclaimed()
+        self.assertTrue(any(key.endswith(b"#mamba") for key in transport.storage))
+        self.assertTrue(transport.peers["tcp://peer:32100"])
+        transport.finish_follows()
+        backend._reap_background()
+        self.assertFalse(transport.peers["tcp://peer:32100"])
+        self.assertEqual(backend.batch_exists_v2(self.keys, transfers).kv_hit_pages, 4)
+        transport.evict_unclaimed()
+        self.assertFalse(transport.storage)
 
     def test_move_invalidates_through_the_named_source_without_waiting(self):
         backend, _, transport, transfers, info, _ = self._move_fixture()
@@ -1403,7 +1484,7 @@ class TestKVCRStorage(CustomTestCase):
         self.assertFalse(transport.peers["tcp://peer:32100"])
         self.assertTrue(transport.claims)
         transport.completed.update(withheld)
-        backend._reap_moves()
+        backend._reap_background()
         self.assertFalse(transport.claims)
         self.assertEqual(backend.batch_exists(self.keys), 4)
 

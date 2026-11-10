@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, field
 from queue import Empty, SimpleQueue
 
 from sglang.srt.managers.kv_hints import decode_kv_hints_envelope
@@ -105,6 +106,27 @@ class _NoFrameworkPinning:
         return False
 
 
+@dataclass(eq=False)
+class _FollowState:
+    """Background retention of one hinted read, or of one hybrid lookup scope."""
+
+    move: bool
+    source: str | None = None
+    # A hybrid scope's full set of required keys; None settles page by page.
+    expected: set | None = None
+    scope: str | None = None
+    request_id: str | None = None
+    # A lookup scope stays open until the controller releases it.
+    released: bool = True
+    local: set = field(default_factory=set)
+    claims: list = field(default_factory=list)
+    pending: set = field(default_factory=set)
+    registrations: list = field(default_factory=list)
+    failed: bool = False
+    settled: bool = False
+    started_epoch: float | None = None
+
+
 class KVCRStore(HiCacheStorage):
     """Optional NIXL/UCX L3 backend using KVCR's indexed-region public API."""
 
@@ -124,6 +146,8 @@ class KVCRStore(HiCacheStorage):
         # A router FETCHABLE verdict alone does not prove source residency.
         self._lookup_claims = {}
         self._move_scopes = {}
+        # Unawaited retention fetches of delivered pages, by handle.
+        self._follow_ops = {}
         # Unawaited source-invalidation fetches; the poll loop releases their claims.
         self._pending_moves = set()
         self._poll_thread = None
@@ -487,146 +511,116 @@ class KVCRStore(HiCacheStorage):
     def _is_move_hint(self, extra_info, keys):
         return self._hint_mode(extra_info, keys) == "move"
 
-    def _retain_read(self, blocks, extra_info, *, move):
-        """Fetch into this KVCR and deliver locally from the retained copy.
+    def _follow_read(self, blocks, result, extra_info, *, move):
+        """Fetch delivered pages into this KVCR in the background.
 
-        Every layout's fetch and the local delivery are submitted together:
-        KVCR serves a delivery for a key it is still filling once its pieces
-        land, so local copies overlap the transfer and the read waits once.
-        With ``move``, pages complete in every pool of this rank then ask the
-        source to drop its copies without waiting. Hybrid lookup scopes span
-        KV batches and the later checkpoint delivery; their claims stay held
-        until all required pools are delivered or the controller releases the
-        lookup. Ranks commit independently.
+        The hinted read itself takes copy's path into HiCache host pages. Each
+        delivered key is then fetched again from the named source into local
+        KVCR without waiting, so the retained copy adds no restore latency.
+        A move asks the source to drop a page only once every required piece
+        of it is held here on this rank; until then the source keeps its copy.
+        Hybrid lookup scopes span KV batches and the checkpoint delivery and
+        settle once all are held. Ranks settle independently.
         """
-        extra = getattr(extra_info, "extra_info", None) or {}
-        scope = extra.get("storage_lookup_scope")
-        state = self._move_scopes.get(scope) if move else None
-        scoped = state is not None
-        if state is None:
-            state = {"claims": [], "delivered": set(), "expected": set()}
-        by_layout = {}
-        for key, refs in blocks.items():
-            by_layout.setdefault(tuple(ref.label for ref in refs), []).append(key)
-        claims, fetched_claims = [], {}
-        pending_fetches, pending_delivery = set(), None
-        try:
-            with self._hint(extra_info, blocks, mode="copy") as request_id:
-                fetches = []
-                for labels, keys in by_layout.items():
-                    fetch_handle = self._runner.fetch(
-                        keys, request_id=request_id, expected_layout=list(labels)
-                    )
-                    fetches.append((keys, fetch_handle))
-                    pending_fetches.add(fetch_handle)
-                handle = pending_delivery = self._runner.deliver(blocks)
-                submitted = time.perf_counter() if self._diagnostic_telemetry else None
-                for keys, fetch_handle in fetches:
-                    fetched = self._wait(fetch_handle)
-                    pending_fetches.remove(fetch_handle)
-                    for key in keys:
-                        entry = fetched.get(key)
-                        if entry is None or not entry.success:
-                            continue
-                        if entry.release_handle is None:
-                            continue
-                        claims.append(entry.release_handle)
-                        fetched_claims[key] = entry.release_handle
-                result = self._wait(handle)
-                pending_delivery = None
-            local = {key for key, entry in result.items() if entry.success}
-            delivered = local & fetched_claims.keys()
-            failed_claims = {
-                claim for key, claim in fetched_claims.items() if key not in local
-            }
-            if failed_claims:
-                # An invalidation can arrive between fetch and local delivery.
-                # Release terminal failures so our claims cannot stall its drain.
-                self._release_claim_handles(list(failed_claims))
-                claims = [claim for claim in claims if claim not in failed_claims]
-            fallback = {key: refs for key, refs in blocks.items() if key not in local}
-            if fallback or local - delivered:
-                # Host-only copies cannot authorize invalidation, including in
-                # later batches of the same scope.
-                state["copy_only"] = True
-            if fallback:
-                # Direct delivery needs no receiver KVCR slot.
-                with self._hint(extra_info, fallback, mode="copy") as request_id:
-                    handle = self._runner.deliver(fallback, request_id=request_id)
-                    result.update(self._wait(handle))
-            # A wait unlocks the adapter: cancellation may have released this
-            # operation while its copy was in flight. Never commit a dead scope.
-            if scoped and self._move_scopes.get(scope) is not state:
-                self._log_move(extra_info, blocks, result, set())
-                return handle, result, submitted
-            if not move:
-                self._log_move(extra_info, blocks, result, set())
-                return handle, result, submitted
-            state["delivered"].update(delivered)
-            state["claims"].extend(claims)
-            claims = []
-            if scoped:
-                ready = not state.get("copy_only") and state["expected"].issubset(
-                    state["delivered"]
-                )
-                complete = state["expected"] if ready else set()
-            else:
-                pools = set(self._layouts) - _TRAILING_POOLS
-                pages = {key.split(b"#", 1)[0].decode() for key in blocks}
-                complete = set()
-                for page in pages:
-                    required = {
-                        block_key(page, self._namespace, name) for name in pools
-                    }
-                    if (
-                        not (set(self._layouts) & _TRAILING_POOLS)
-                        and required
-                        and required.issubset(delivered)
-                    ):
-                        complete.update(required)
-            # Detach before submission: reentrant cancellation must not release
-            # these claims before every pool's invalidation fetch has its own.
-            if complete:
-                claims, state["claims"] = state["claims"], []
-            invalidated = self._invalidate_move(complete, extra_info)
-            if complete:
-                self._reap_moves()
-            self._log_move(extra_info, blocks, result, invalidated, complete)
-            return handle, result, submitted
-        except Exception:
-            if scoped and self._move_scopes.get(scope) is state:
-                self._release_lookup_locked(scope)
-            raise
-        finally:
-            # A later submission can fail while earlier fetches already own
-            # claims. Drain submitted IO before returning its host buffers.
-            for fetch_handle in pending_fetches:
-                fetched = self._wait(fetch_handle)
-                claims.extend(
-                    entry.release_handle
-                    for entry in fetched.values()
-                    if entry.success and entry.release_handle is not None
-                )
-            if pending_delivery is not None:
-                self._wait(pending_delivery)
-            if claims:
-                self._release_claim_handles(claims)
-            if not scoped:
-                self._release_claim_handles(state["claims"])
-
-    def _invalidate_move(self, keys, extra_info):
-        """Ask the hinted source to drop copies this rank now holds.
-
-        Each pool's move fetch hits only local copies, so KVCR sends the source
-        a one-way invalidation; the read does not wait for it.
-        """
-        if not keys:
-            return set()
-        hint = self._operation_hint(extra_info, list(keys))
+        hint = self._operation_hint(extra_info, list(blocks))
         source = (
             hint["actions"][0]["payload"]["source_control_endpoint"] if hint else None
         )
-        if not source:
+        extra = getattr(extra_info, "extra_info", None) or {}
+        scope = extra.get("storage_lookup_scope")
+        state = self._move_scopes.get(scope) if move and scope else None
+        if state is None:
+            state = _FollowState(move=move, request_id=extra.get("request_id"))
+        if state.started_epoch is None:
+            state.started_epoch = time.time()
+        delivered = [key for key in blocks if key in result and result[key].success]
+        if len(delivered) != len(blocks) or source is None:
+            state.failed = True
+        if state.source is None:
+            state.source = source
+        elif source != state.source:
+            state.failed = True
+        if source is None or not delivered:
+            self._maybe_settle(state)
+            return
+        if self._inventory is not None:
+            # Native residency completes after this read returns; keep the
+            # event metadata until the follow-up fetch settles.
+            state.registrations.append(
+                self._inventory.register(extra.get("kv_event_metadata", {}), delivered)
+            )
+        by_layout = {}
+        for key in delivered:
+            by_layout.setdefault(tuple(ref.label for ref in blocks[key]), []).append(
+                key
+            )
+        for labels, keys in by_layout.items():
+            try:
+                handle = self._runner.fetch(
+                    keys, expected_layout=list(labels), source_endpoint=source
+                )
+            except Exception:
+                logger.warning(
+                    "KVCR retention fetch failed for %d keys", len(keys), exc_info=True
+                )
+                state.failed = True
+                continue
+            state.pending.add(handle)
+            self._follow_ops[handle] = state
+        self._completed.update(self._runner.poll_completed())
+        self._reap_background_locked()
+        self._completion.notify_all()
+        self._maybe_settle(state)
+
+    def _maybe_settle(self, state):
+        if state.settled or state.pending:
+            return False
+        if state.released or (
+            state.expected is not None and state.expected <= state.local
+        ):
+            return self._settle_follow(state)
+        return False
+
+    def _settle_follow(self, state):
+        """Release retention claims, after invalidating complete moved pages."""
+        state.settled = True
+        if state.scope is not None and self._move_scopes.get(state.scope) is state:
+            del self._move_scopes[state.scope]
+        complete = set()
+        if state.move and state.source is not None:
+            if state.expected is not None:
+                # A scope with any failed piece keeps its source: a later retry
+                # of one pool cannot vouch for the batches that missed.
+                if not state.failed and state.expected <= state.local:
+                    complete = set(state.expected)
+            elif not set(self._layouts) & _TRAILING_POOLS:
+                pools = set(self._layouts) - _TRAILING_POOLS
+                for page in {key.split(b"#", 1)[0].decode() for key in state.local}:
+                    required = {
+                        block_key(page, self._namespace, name) for name in pools
+                    }
+                    if required and required <= state.local:
+                        complete |= required
+        # The invalidation fetches claim these keys at admission, so ours can
+        # be released once they are submitted.
+        invalidated = self._invalidate_move(complete, state.source)
+        claims, state.claims = state.claims, []
+        if claims and not all(ok for _, ok in self._runner.release(claims)):
+            logger.warning("KVCR could not release %d retention claims", len(claims))
+        if self._inventory is not None:
+            for pages in state.registrations:
+                self._inventory.release(pages)
+        state.registrations = []
+        self._log_follow(state, invalidated, complete)
+        return bool(invalidated)
+
+    def _invalidate_move(self, keys, source):
+        """Ask the source to drop copies this rank now holds.
+
+        Each pool's move fetch hits only local copies, so KVCR sends the source
+        a one-way invalidation; nothing waits for it.
+        """
+        if not keys or not source:
             return set()
         by_pool = {}
         for key in keys:
@@ -650,14 +644,32 @@ class KVCRStore(HiCacheStorage):
             requested.update(pending)
         return requested
 
-    def _reap_moves(self):
-        """Release finished invalidation claims without waiting for the rest."""
+    def _reap_background(self):
+        """Settle finished retention and invalidation fetches without waiting."""
         with self._completion:
             self._completed.update(self._runner.poll_completed())
-            self._reap_moves_locked()
+            self._reap_background_locked()
             self._completion.notify_all()
 
-    def _reap_moves_locked(self):
+    def _reap_background_locked(self):
+        invalidated = False
+        for handle in [h for h in self._follow_ops if h in self._completed]:
+            state = self._follow_ops.pop(handle)
+            state.pending.discard(handle)
+            for key, entry in self._completed.pop(handle).items():
+                if entry.success and entry.release_handle is not None:
+                    state.claims.append(entry.release_handle)
+                    state.local.add(key)
+                else:
+                    state.failed = True
+            try:
+                invalidated |= self._maybe_settle(state)
+            except Exception:
+                # The poll loop treats exceptions as fatal; retention is best
+                # effort and the source keeps its copy.
+                logger.warning("KVCR retention settle failed", exc_info=True)
+        if invalidated:
+            self._completed.update(self._runner.poll_completed())
         for handle in [h for h in self._pending_moves if h in self._completed]:
             self._pending_moves.discard(handle)
             handles = [
@@ -668,16 +680,9 @@ class KVCRStore(HiCacheStorage):
             if handles and not all(ok for _, ok in self._runner.release(handles)):
                 logger.warning("KVCR move cleanup could not release its claims")
 
-    def _log_move(self, extra_info, blocks, results, invalidated, complete=()):
+    def _log_follow(self, state, invalidated, complete):
         if not self._diagnostic_telemetry:
             return
-        extra = getattr(extra_info, "extra_info", None) or {}
-        pages = {key.split(b"#", 1)[0].decode() for key in blocks}
-        failed = {
-            key.split(b"#", 1)[0].decode()
-            for key in blocks
-            if key not in results or not results[key].success
-        }
         moved_pages = {key.split(b"#", 1)[0].decode() for key in complete}
         incomplete_invalidations = {
             key.split(b"#", 1)[0].decode() for key in complete if key not in invalidated
@@ -688,17 +693,21 @@ class KVCRStore(HiCacheStorage):
             json.dumps(
                 {
                     "epoch": time.time(),
-                    "request_id": extra.get("request_id"),
-                    "scope": extra.get("storage_lookup_scope"),
+                    "start_epoch": state.started_epoch,
+                    "mode": "move" if state.move else "retain",
+                    "request_id": state.request_id,
+                    "scope": state.scope,
                     "rank": self._offset,
                     "tp_rank": self.config.tp_rank,
                     "cp_rank": self.config.attn_cp_rank,
                     "endpoint": self._control_endpoint,
-                    "delivered_pages": sorted(pages - failed),
-                    "failed_pages": sorted(failed),
+                    "source": state.source,
+                    "retained_pages": sorted(
+                        {key.split(b"#", 1)[0].decode() for key in state.local}
+                    ),
+                    "retention_failed": state.failed,
                     "moved_pages": sorted(moved_pages),
                     "pages_moved": len(moved_pages),
-                    "pages_failed": len(failed),
                     "pages_invalidation_requested": len(invalidated_pages),
                     "invalidation_failed_pages": sorted(
                         moved_pages - invalidated_pages
@@ -718,7 +727,7 @@ class KVCRStore(HiCacheStorage):
         with self._completion:
             while handle not in self._completed:
                 self._completed.update(self._runner.poll_completed())
-                self._reap_moves_locked()
+                self._reap_background_locked()
                 if handle not in self._completed:
                     self._completion.wait(timeout=0.001)
             result = self._completed.pop(handle)
@@ -730,7 +739,7 @@ class KVCRStore(HiCacheStorage):
             try:
                 with self._completion:
                     self._completed.update(self._runner.poll_completed())
-                    self._reap_moves_locked()
+                    self._reap_background_locked()
                     self._completion.notify_all()
                     if self._diagnostic_telemetry:
                         self._drain_diagnostics()
@@ -909,21 +918,17 @@ class KVCRStore(HiCacheStorage):
                 )
                 move = mode == "move"
                 retain = move or (mode == "copy" and self._retain_hinted_reads)
-                if retain:
-                    # The fetches and the local delivery all wait in here.
-                    handle, result, submitted = self._retain_read(
-                        blocks, extra_info, move=move
-                    )
-                else:
-                    handle = (
-                        self._runner.deposit(blocks)
-                        if is_set
-                        else self._runner.deliver(blocks, request_id=request_id)
-                    )
-                    submitted = time.perf_counter() if diagnostic else None
-                    # _wait releases the condition's recursive lock while sleeping.
-                    result = self._wait(handle)
+                handle = (
+                    self._runner.deposit(blocks)
+                    if is_set
+                    else self._runner.deliver(blocks, request_id=request_id)
+                )
+                submitted = time.perf_counter() if diagnostic else None
+                # _wait releases the condition's recursive lock while sleeping.
+                result = self._wait(handle)
                 finished = time.perf_counter() if diagnostic else None
+                if retain:
+                    self._follow_read(blocks, result, extra_info, move=move)
                 if diagnostic:
                     logger.info(
                         "KVCR L3 operation %s",
@@ -1202,15 +1207,18 @@ class KVCRStore(HiCacheStorage):
             raise RuntimeError("KVCR trailing-state claim release failed")
 
     def _release_lookup_locked(self, scope):
-        move = self._move_scopes.pop(scope, None)
-        if move is not None:
-            self._release_claim_handles(move["claims"])
-        claims = self._lookup_claims.get(scope)
-        if not claims:
-            self._lookup_claims.pop(scope, None)
-            return
+        state = self._move_scopes.pop(scope, None)
+        claims = self._lookup_claims.pop(scope, None) or {}
+        if state is not None and not state.settled:
+            state.released = True
+            if state.pending:
+                # Retention fetches may still complete this move: the source may
+                # drop the checkpoint only while this rank still holds it.
+                state.claims.extend(claims.values())
+                claims = {}
+            else:
+                self._settle_follow(state)
         self._release_claim_handles(list(claims.values()))
-        del self._lookup_claims[scope]
 
     def release_lookup(self, scope: str) -> None:
         with self._lock:
@@ -1299,11 +1307,14 @@ class KVCRStore(HiCacheStorage):
                     expected.update(
                         key for pending in windows.values() for key in pending
                     )
-                    self._move_scopes[scope] = {
-                        "claims": [],
-                        "delivered": set(),
-                        "expected": expected,
-                    }
+                    extra = getattr(extra_info, "extra_info", None) or {}
+                    self._move_scopes[scope] = _FollowState(
+                        move=True,
+                        expected=expected,
+                        scope=scope,
+                        request_id=extra.get("request_id"),
+                        released=False,
+                    )
                 return True
             except Exception:
                 if self._lookup_claims.get(scope) is claims:
