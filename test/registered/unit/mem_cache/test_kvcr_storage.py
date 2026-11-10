@@ -240,6 +240,7 @@ class _RetainedMoveTransport(_StrictPeerTransport):
         self.on_move = None
         self.invalidate_before_delivery = set()
         self.pending_removal = set()
+        self.moves = []
 
     def deliver(self, blocks, request_id=None):
         if request_id is None:
@@ -258,7 +259,15 @@ class _RetainedMoveTransport(_StrictPeerTransport):
         )
         return handle
 
-    def fetch(self, keys, request_id=None, expected_layout=None):
+    def fetch(
+        self,
+        keys,
+        request_id=None,
+        expected_layout=None,
+        *,
+        source_endpoint=None,
+        move=False,
+    ):
         if any(key.decode().endswith("#" + str(self.raise_pool)) for key in keys):
             raise RuntimeError("pool fetch failed")
         accepted = [
@@ -279,9 +288,10 @@ class _RetainedMoveTransport(_StrictPeerTransport):
         successful = [key for key, entry in result.items() if entry.success]
         if self.inventory is not None:
             self.inventory.update(SimpleNamespace(keys=successful, removed=False))
-        hint = self.hints.get(request_id)
-        if hint is not None and hint["actions"][0]["payload"]["mode"] == "move":
-            peer = self.peers[hint["actions"][0]["payload"]["source_control_endpoint"]]
+        if move:
+            # A named-source move of complete local copies invalidates the source.
+            self.moves.append((source_endpoint, tuple(keys), request_id))
+            peer = self.peers[source_endpoint]
             for key in successful:
                 peer.pop(key, None)
             if self.on_move is not None:
@@ -995,10 +1005,11 @@ class TestKVCRStorage(CustomTestCase):
             for prior, actual in zip(before[name], pool.buffers):
                 self.assertTrue(torch.equal(prior, actual))
 
-    def _move_fixture(self, enabled=True, trailing=False, publish=False):
+    def _move_fixture(self, enabled=True, trailing=False, publish=False, retain=False):
         config = copy.copy(self.config)
         config.extra_config = {
             "enable_move_hint": enabled,
+            "retain_hinted_reads": retain,
             "publish_inventory": publish,
             "control_advertise_host": "127.0.0.1",
         }
@@ -1228,10 +1239,10 @@ class TestKVCRStorage(CustomTestCase):
         self.assertFalse(transport.storage)
 
     def test_prefetch_metadata_publishes_only_retained_move_pages(self):
-        for mode, count in (("copy", 0), ("move", 4)):
-            with self.subTest(mode=mode):
+        for mode, retain, count in (("copy", False, 0), ("copy", True, 4), ("move", False, 4)):
+            with self.subTest(mode=mode, retain=retain):
                 backend, _, transport, transfers, info, _ = self._move_fixture(
-                    publish=True
+                    publish=True, retain=retain
                 )
                 info.extra_info["kv_hints"]["actions"][0]["payload"]["mode"] = mode
                 info.extra_info["kv_event_metadata"] = {
@@ -1250,11 +1261,16 @@ class TestKVCRStorage(CustomTestCase):
                 self.assertTrue(all(event.ownership == "kvcr" for event in events))
 
     def test_move_rejects_shared_mla_before_io(self):
-        config = copy.copy(self.config)
-        config.is_mla_model = True
-        config.extra_config = {"enable_move_hint": True, "share_replicated_mla": True}
-        with self.assertRaisesRegex(ValueError, "move hints do not support shared MLA"):
-            KVCRStore(config, self.pool)
+        for option, message in (
+            ("enable_move_hint", "move hints do not support shared MLA"),
+            ("retain_hinted_reads", "retained reads do not support shared MLA"),
+        ):
+            with self.subTest(option=option):
+                config = copy.copy(self.config)
+                config.is_mla_model = True
+                config.extra_config = {option: True, "share_replicated_mla": True}
+                with self.assertRaisesRegex(ValueError, message):
+                    KVCRStore(config, self.pool)
 
     def test_move_hint_without_opt_in_never_reads_the_peer(self):
         backend, _, transport, transfers, info, _ = self._move_fixture(enabled=False)
@@ -1262,6 +1278,95 @@ class TestKVCRStorage(CustomTestCase):
         self.assertEqual(result, {"kv": [False] * 4, "indexer": [False] * 4})
         self.assertEqual(backend.batch_exists(self.keys), 0)
         self.assertEqual(len(transport.peers["tcp://peer:32100"]), 8)
+
+    def test_retained_copy_keeps_both_copies_and_releases_its_claims(self):
+        for retain in (False, True):
+            with self.subTest(retain=retain):
+                backend, pools, transport, transfers, info, expected = (
+                    self._move_fixture(enabled=False, retain=retain)
+                )
+                info.extra_info["kv_hints"]["actions"][0]["payload"]["mode"] = "copy"
+                self.assertEqual(
+                    backend.batch_get_v2(transfers, info),
+                    {"kv": [True] * 4, "indexer": [True] * 4},
+                )
+                self.assertEqual(len(transport.peers["tcp://peer:32100"]), 8)
+                self.assertFalse(transport.moves)
+                self.assertFalse(transport.claims)
+                self.assertEqual(len(transport.storage), 8 if retain else 0)
+                for name, pool in pools.items():
+                    for actual, wanted in zip(pool.buffers, expected[name]):
+                        self.assertTrue(torch.equal(actual[:4], wanted[:4]))
+
+    def test_retained_read_submits_local_delivery_before_waiting(self):
+        """Fetches and the local delivery overlap; the read waits once."""
+        backend, _, transport, transfers, info, _ = self._move_fixture(
+            enabled=False, retain=True
+        )
+        info.extra_info["kv_hints"]["actions"][0]["payload"]["mode"] = "copy"
+        order = []
+        fetch, deliver, poll = (
+            transport.fetch,
+            transport.deliver,
+            transport.poll_completed,
+        )
+
+        def tracked_fetch(*args, **kwargs):
+            order.append("fetch")
+            return fetch(*args, **kwargs)
+
+        def tracked_deliver(blocks, request_id=None):
+            order.append("deliver" if request_id is None else "copy")
+            return deliver(blocks, request_id)
+
+        def tracked_poll():
+            order.append("poll")
+            return poll()
+
+        transport.fetch = tracked_fetch
+        transport.deliver = tracked_deliver
+        transport.poll_completed = tracked_poll
+        backend.batch_get_v2(transfers, info)
+        self.assertEqual(order[:3], ["fetch", "fetch", "deliver"])
+        self.assertNotIn("copy", order)
+
+    def test_move_invalidates_through_the_named_source_without_waiting(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture()
+        withheld, polls = {}, {"count": 0}
+        fetch, poll = transport.fetch, transport.poll_completed
+
+        def withhold_moves(keys, request_id=None, expected_layout=None, **kwargs):
+            handle = fetch(keys, request_id, expected_layout, **kwargs)
+            if kwargs.get("move"):
+                withheld[handle] = transport.completed.pop(handle)
+            return handle
+
+        def poll_or_force():
+            polls["count"] += 1
+            if polls["count"] > 1000 and withheld:
+                # Only an adapter that waits on the invalidation reaches here.
+                polls["forced"] = True
+                transport.completed.update(withheld)
+                withheld.clear()
+            return poll()
+
+        transport.fetch = withhold_moves
+        transport.poll_completed = poll_or_force
+        self.assertEqual(
+            backend.batch_get_v2(transfers, info),
+            {"kv": [True] * 4, "indexer": [True] * 4},
+        )
+        self.assertNotIn("forced", polls)
+        self.assertEqual(
+            [(source, request_id) for source, _, request_id in transport.moves],
+            [("tcp://peer:32100", None)] * 2,
+        )
+        self.assertFalse(transport.peers["tcp://peer:32100"])
+        self.assertTrue(transport.claims)
+        transport.completed.update(withheld)
+        backend._reap_moves()
+        self.assertFalse(transport.claims)
+        self.assertEqual(backend.batch_exists(self.keys), 4)
 
     def test_advisory_mamba_hint_requires_source_checkpoint_and_held_copy(self):
         """A logical-page hint must not admit absent Mamba, and a confirmed

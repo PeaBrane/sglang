@@ -61,22 +61,30 @@ provided by the companion in-process Dynamo SGLang integration. A query is
 advisory; terminal delivery determines which pages are usable. Missing hints
 do not authorize fetching from an unrelated replica.
 
-Move hints require `"enable_move_hint": true` and a KVCR version that supports
-move advice (tested against KVCR revision `419ac8b`). The default remains copy.
-A move first copy-fetches every required physical layout into the receiver's
-KVCR storage and holds its claims through local host-page delivery. Only pages
-complete in every required pool of this rank are re-fetched with move advice.
-Those pinned local hits request source invalidation; the receiver releases the
-claims afterward and keeps the cached data. Move enables combined KV/indexer
-reads even when `combine_page_reads` is false. Keys the receiver cannot retain or
-deliver locally fall back to ordinary copy delivery into the same host pages,
-without invalidation. Terminal local-delivery failures release their fetch claims
-first, allowing a delayed invalidation to drain before the copy retry.
+Hinted reads normally copy straight into HiCache host pages and leave nothing in
+the receiver's KVCR. With `"retain_hinted_reads": true`, a copy-mode read also
+keeps the pages: it fetches every required physical layout into the receiver's
+KVCR storage and, in the same submission, delivers them locally into the host
+pages. KVCR serves that delivery as each key's fill lands, so the local copies
+overlap the transfer and the read waits once. The claims are released after
+delivery and the retained copy stays cached and advertised. Retaining duplicates
+the source's copy; the default remains off.
+
+Move hints require `"enable_move_hint": true` and a KVCR whose public `fetch`
+accepts `source_endpoint` and `move` (tested against KVCR main `6d54642` with
+that API exposed). A move is a retained read followed by source invalidation:
+only pages complete in every required pool of this rank are fetched again with
+`move=True` from the hinted source. Those are local hits, so KVCR sends the source
+a one-way invalidation, and the read does not wait for it. Move enables combined
+KV/indexer reads even when `combine_page_reads` is false. Keys the receiver cannot
+retain or deliver locally fall back to ordinary copy delivery into the same host
+pages, without invalidation. Terminal local-delivery failures release their fetch
+claims first, allowing a delayed invalidation to drain before the copy retry.
 Capacity rejection therefore does not reduce restore coverage relative to a copy
-read with the same source availability. KVCR `419ac8b` rejects both fetch and
-direct delivery while a receiver key is pending removal; fallback cannot bypass
-that barrier if another operation still holds it. A page moves only if every required component was retained and
-delivered.
+read with the same source availability. KVCR rejects both fetch and direct
+delivery while a receiver key is pending removal; fallback cannot bypass that
+barrier if another operation still holds it. A page moves only if every required
+component was retained and delivered.
 Hybrid restores hold copies under
 the controller's operation scope across KV batches and trailing-state delivery;
 they invalidate only after the confirmed prefix and checkpoints are all local.
@@ -100,7 +108,7 @@ remain governed by SGLang's existing cache policy; this option neither evicts
 them nor marks them relinquished. A later framework backup can recreate the
 source's KVCR copy.
 
-In that KVCR revision, invalidation is per physical key and has no deletion
+KVCR invalidation is per physical key and has no deletion
 acknowledgment. The adapter's copy/pin/deliver phase closes the within-rank
 partial-pool loss window before requesting invalidation. Lost invalidation can
 leave both workers with a copy. It provides no cross-rank commit protocol,
