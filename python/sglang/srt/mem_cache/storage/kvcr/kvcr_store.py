@@ -534,6 +534,8 @@ class KVCRStore(HiCacheStorage):
         state = self._move_scopes.get(scope) if scope else None
         if state is None:
             state = _FollowState(move=move, request_id=extra.get("request_id"))
+        elif state.move != move:
+            state.failed = True
         if state.started_epoch is None:
             state.started_epoch = time.time()
         delivered = [key for key in blocks if key in result and result[key].success]

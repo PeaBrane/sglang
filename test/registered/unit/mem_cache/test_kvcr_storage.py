@@ -21,6 +21,7 @@ import torch
 
 from sglang.srt.disaggregation.kv_events import BlockStored
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.managers.kv_hints import decode_kv_hints_envelope
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 from sglang.srt.mem_cache.hicache_storage import (
@@ -1261,6 +1262,75 @@ class TestKVCRStorage(CustomTestCase):
         backend.release_lookup("restore-1")
         backend._reap_background()
         self.assertFalse(transport.peers["tcp://peer:32100"])
+
+    def test_mixed_hint_modes_within_one_hybrid_scope_preserve_source(self):
+        backend, pools, transport, transfers, info, expected = self._move_fixture(
+            trailing=True, retain=True
+        )
+        mapping = {key: 17 + index for index, key in enumerate(self.keys)}
+        info.extra_info["storage_lookup_scope"] = "restore-1"
+        info.extra_info["storage_key_to_event_hash"] = mapping
+        envelope = decode_kv_hints_envelope(
+            {
+                "protocol_version": "0.1",
+                "message_id": "mixed-modes",
+                "actions": [
+                    {
+                        "action_id": mode,
+                        "action_type": "kv.fetch",
+                        "action_version": "1.0",
+                        "payload": {
+                            "source_control_endpoint": "tcp://peer:32100",
+                            "block_hashes": [mapping[key] for key in keys],
+                            "mode": mode,
+                        },
+                    }
+                    for mode, keys in (
+                        ("move", self.keys[-1:]),
+                        ("copy", self.keys[:-1]),
+                    )
+                ],
+            }
+        )
+        info.extra_info["kv_hints"] = envelope
+        original_envelope = msgspec.json.encode(envelope)
+        source = copy.deepcopy(transport.peers["tcp://peer:32100"])
+        self.assertTrue(
+            backend.confirm_lookup(self.keys, transfers, 4, info, "restore-1")
+        )
+        modes = []
+        deliver = transport.deliver
+
+        def tracked_deliver(blocks, request_id=None):
+            modes.append(transport.hints[request_id]["actions"][0]["payload"]["mode"])
+            return deliver(blocks, request_id)
+
+        transport.deliver = tracked_deliver
+        for keys, indices in (
+            (self.keys[:-1], torch.arange(6)),
+            (self.keys[-1:], torch.arange(6, 8)),
+        ):
+            batch = [
+                PoolTransfer(transfer.name, keys=keys, host_indices=indices)
+                for transfer in transfers[:2]
+            ]
+            self.assertEqual(
+                backend.batch_get_v2(batch, info),
+                {"kv": [True] * len(keys), "indexer": [True] * len(keys)},
+            )
+        self.assertEqual(backend.batch_get_v2(transfers[2:], info), {"mamba": [True]})
+        self.assertEqual(modes, ["copy", "move", "move"])
+        backend.release_lookup("restore-1")
+        backend._reap_background()
+        self.assertEqual(transport.peers["tcp://peer:32100"], source)
+        self.assertFalse(transport.moves)
+        self.assertFalse(transport.claims)
+        self.assertEqual(set(transport.storage), set(source))
+        self.assertEqual(msgspec.json.encode(envelope), original_envelope)
+        for name, pool in pools.items():
+            count = 1 if name == PoolName.MAMBA else 4
+            for actual, wanted in zip(pool.buffers, expected[name]):
+                self.assertTrue(torch.equal(actual[:count], wanted[:count]))
 
     def test_cancelled_hybrid_move_preserves_source(self):
         backend, _, transport, transfers, info, _ = self._move_fixture(trailing=True)

@@ -95,7 +95,8 @@ retention is queued or running, the scope's checkpoint claims are kept until
 the follow-up fetches settle. Cancellation before every piece is delivered, scope replacement and
 errors keep the source. Trailing pools without a confirmed operation scope use
 copy-only behavior. Any failed delivery or follow-up fetch in a scope keeps the
-source for the entire scope. If the controller trims an already-confirmed prefix
+source for the entire scope. A scope that mixes copy and move actions also
+keeps its source. If the controller trims an already-confirmed prefix
 head, the scope still expects that head and safely leaves the source intact;
 trimmed scopes do not commit moves.
 
