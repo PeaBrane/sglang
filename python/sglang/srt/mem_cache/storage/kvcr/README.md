@@ -61,38 +61,44 @@ provided by the companion in-process Dynamo SGLang integration. A query is
 advisory; terminal delivery determines which pages are usable. Missing hints
 do not authorize fetching from an unrelated replica.
 
-Hinted reads normally copy straight into HiCache host pages and leave nothing in
-the receiver's KVCR. With `"retain_hinted_reads": true`, a copy-mode read also
-keeps the pages: it fetches every required physical layout into the receiver's
-KVCR storage and, in the same submission, delivers them locally into the host
-pages. KVCR serves that delivery as each key's fill lands, so the local copies
-overlap the transfer and the read waits once. The claims are released after
-delivery and the retained copy stays cached and advertised. Retaining duplicates
-the source's copy; the default remains off.
+Hinted reads normally copy KV/indexer pages straight into HiCache host pages
+without retaining them in the receiver's KVCR. Hybrid lookup confirmation
+separately fetches and pins the trailing checkpoint in receiver KVCR. With `"retain_hinted_reads": true`, a copy-mode read also
+queues retention after an ordinary copy delivery into the host pages. The
+background progress owner fetches delivered keys from the hinted source into
+the receiver's KVCR. Hybrid scopes defer submission until the controller
+releases the delivery scope; unscoped reads can progress after their IO lock
+is released. The read never waits for the queued fetch to finish. A missing receiver key requires
+a second network transfer; a checkpoint already fetched by confirmation is a
+local hit.
+Background work still shares CPU, locks and transport resources with requests,
+so this does not guarantee identical TTFT to ordinary copy. Once the fetch completes, its claims are released and the
+retained copy stays cached and advertised. Retaining duplicates
+the source's copy; the default remains off. A failed follow-up fetch only means
+the receiver keeps no copy; it never fails the read.
 
 Move hints require `"enable_move_hint": true` and a KVCR whose public `fetch`
 accepts `source_endpoint` and `move` (tested against KVCR main `6d54642` with
 that API exposed). A move is a retained read followed by source invalidation:
-only pages complete in every required pool of this rank are fetched again with
-`move=True` from the hinted source. Those are local hits, so KVCR sends the source
-a one-way invalidation, and the read does not wait for it. Move enables combined
-KV/indexer reads even when `combine_page_reads` is false. Keys the receiver cannot
-retain or deliver locally fall back to ordinary copy delivery into the same host
-pages, without invalidation. Terminal local-delivery failures release their fetch
-claims first, allowing a delayed invalidation to drain before the copy retry.
-Capacity rejection therefore does not reduce restore coverage relative to a copy
-read with the same source availability. KVCR rejects both fetch and direct
-delivery while a receiver key is pending removal; fallback cannot bypass that
-barrier if another operation still holds it. A page moves only if every required
-component was retained and delivered.
-Hybrid restores hold copies under
-the controller's operation scope across KV batches and trailing-state delivery;
-they invalidate only after the confirmed prefix and checkpoints are all local.
-Cancellation, scope replacement and errors release the held claims. Trailing
-pools without a confirmed operation scope use copy-only behavior.
-A scoped restore that uses copy fallback stays copy-only for the entire scope.
-If the controller trims an already-confirmed prefix head, the scope still expects
-that head and safely leaves the source intact; trimmed scopes do not commit moves.
+once the follow-up fetch holds every required pool of a page on this rank, those
+keys are fetched again with `move=True` from the hinted source. They are local
+hits, so KVCR sends the source a one-way invalidation, and nothing waits for it.
+For an isolated one-way move, this orders local pool completeness before
+requesting source cleanup on each rank. Move enables combined KV/indexer reads
+even when `combine_page_reads` is false. A page
+whose follow-up fetch misses any pool, for example under capacity pressure or
+while the receiver key is pending removal, keeps its source copy.
+Hybrid restores track the controller's operation scope across KV batches and
+trailing-state delivery; they invalidate only after the confirmed prefix and
+checkpoints are all held locally. If the controller releases the scope while
+retention is queued or running, the scope's checkpoint claims are kept until
+the follow-up fetches settle. Cancellation before every piece is delivered, scope replacement and
+errors keep the source. Trailing pools without a confirmed operation scope use
+copy-only behavior. Any failed delivery or follow-up fetch in a scope keeps the
+source for the entire scope. A scope that mixes copy and move actions also
+keeps its source. If the controller trims an already-confirmed prefix
+head, the scope still expects that head and safely leaves the source intact;
+trimmed scopes do not commit moves.
 
 TP and CP ranks move independently. If ranks diverge, a logical KVCR page can become
 unusable on both workers even though each moved shard reached its destination.
@@ -109,10 +115,12 @@ them nor marks them relinquished. A later framework backup can recreate the
 source's KVCR copy.
 
 KVCR invalidation is per physical key and has no deletion
-acknowledgment. The adapter's copy/pin/deliver phase closes the within-rank
-partial-pool loss window before requesting invalidation. Lost invalidation can
-leave both workers with a copy. It provides no cross-rank commit protocol,
-crash durability, or framework-wide stale-GPU relinquish guard.
+acknowledgment. Requiring every pool of a page to be held locally first closes the
+within-rank partial-pool loss window for an isolated one-way move. Lost
+invalidation can leave both workers with a copy. Opposing moves can instead
+lose both KVCR copies when delayed invalidations reach reused local residencies.
+The protocol has no migration epoch, cross-rank commit, crash durability or
+framework-wide stale-GPU relinquish guard.
 
 For backend-owned routing inventory, opt in with `"publish_inventory": true`
 in the backend extra configuration and configure a ZMQ KV-event publisher
@@ -122,10 +130,12 @@ stores/removals carry `ownership="kvcr"`. A logical page is advertised after
 all required physical pools and attention shards own it, and withdrawn when
 any required shard/pool removes it. Trailing/checkpoint admission is still
 verified by the storage query and terminal read.
-Existing prefetch metadata also lets retained move reads publish destination
-Stored events; ordinary copy delivery retains no KV/indexer data to advertise.
-With `diagnostic_telemetry`, request/rank move records report complete local
-pages, failed pages and requested invalidations. Requested invalidation does
+Existing prefetch metadata also lets retained and moved pages publish destination
+Stored events once the follow-up fetch lands; the adapter keeps that metadata
+until then. Ordinary copy delivery retains no KV/indexer data to advertise.
+With `diagnostic_telemetry`, request/rank move records report retained pages,
+moved pages, requested invalidations and the follow-up window (`start_epoch` to
+`epoch`). Requested invalidation does
 not acknowledge source removal; observe the published ownership events too.
 
 The companion Dynamo integration requires its KV state-agent host, started
