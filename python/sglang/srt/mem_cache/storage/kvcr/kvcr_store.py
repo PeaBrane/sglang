@@ -679,13 +679,10 @@ class KVCRStore(HiCacheStorage):
             if key not in results or not results[key].success
         }
         moved_pages = {key.split(b"#", 1)[0].decode() for key in complete}
-        invalidated_pages = {
-            page
-            for page in moved_pages
-            if {
-                key for key in complete if key.startswith(page.encode() + b"#")
-            }.issubset(invalidated)
+        incomplete_invalidations = {
+            key.split(b"#", 1)[0].decode() for key in complete if key not in invalidated
         }
+        invalidated_pages = moved_pages - incomplete_invalidations
         logger.info(
             "KVCR L3 move outcome %s",
             json.dumps(
