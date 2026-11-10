@@ -509,20 +509,21 @@ class KVCRStore(HiCacheStorage):
         for key, refs in blocks.items():
             by_layout.setdefault(tuple(ref.label for ref in refs), []).append(key)
         claims, fetched_claims = [], {}
+        pending_fetches, pending_delivery = set(), None
         try:
             with self._hint(extra_info, blocks, mode="copy") as request_id:
-                fetches = [
-                    (
-                        keys,
-                        self._runner.fetch(
-                            keys, request_id=request_id, expected_layout=list(labels)
-                        ),
+                fetches = []
+                for labels, keys in by_layout.items():
+                    fetch_handle = self._runner.fetch(
+                        keys, request_id=request_id, expected_layout=list(labels)
                     )
-                    for labels, keys in by_layout.items()
-                ]
-                handle = self._runner.deliver(blocks)
+                    fetches.append((keys, fetch_handle))
+                    pending_fetches.add(fetch_handle)
+                handle = pending_delivery = self._runner.deliver(blocks)
+                submitted = time.perf_counter() if self._diagnostic_telemetry else None
                 for keys, fetch_handle in fetches:
                     fetched = self._wait(fetch_handle)
+                    pending_fetches.remove(fetch_handle)
                     for key in keys:
                         entry = fetched.get(key)
                         if entry is None or not entry.success:
@@ -532,6 +533,7 @@ class KVCRStore(HiCacheStorage):
                         claims.append(entry.release_handle)
                         fetched_claims[key] = entry.release_handle
                 result = self._wait(handle)
+                pending_delivery = None
             local = {key for key, entry in result.items() if entry.success}
             delivered = local & fetched_claims.keys()
             failed_claims = {
@@ -556,10 +558,10 @@ class KVCRStore(HiCacheStorage):
             # operation while its copy was in flight. Never commit a dead scope.
             if scoped and self._move_scopes.get(scope) is not state:
                 self._log_move(extra_info, blocks, result, set())
-                return handle, result
+                return handle, result, submitted
             if not move:
                 self._log_move(extra_info, blocks, result, set())
-                return handle, result
+                return handle, result, submitted
             state["delivered"].update(delivered)
             state["claims"].extend(claims)
             claims = []
@@ -582,19 +584,31 @@ class KVCRStore(HiCacheStorage):
                         and required.issubset(delivered)
                     ):
                         complete.update(required)
-            # The invalidation fetches claim these keys at admission, so ours
-            # can be released once they are submitted.
-            invalidated = self._invalidate_move(complete, extra_info)
+            # Detach before submission: reentrant cancellation must not release
+            # these claims before every pool's invalidation fetch has its own.
             if complete:
                 claims, state["claims"] = state["claims"], []
+            invalidated = self._invalidate_move(complete, extra_info)
+            if complete:
                 self._reap_moves()
             self._log_move(extra_info, blocks, result, invalidated, complete)
-            return handle, result
+            return handle, result, submitted
         except Exception:
             if scoped and self._move_scopes.get(scope) is state:
                 self._release_lookup_locked(scope)
             raise
         finally:
+            # A later submission can fail while earlier fetches already own
+            # claims. Drain submitted IO before returning its host buffers.
+            for fetch_handle in pending_fetches:
+                fetched = self._wait(fetch_handle)
+                claims.extend(
+                    entry.release_handle
+                    for entry in fetched.values()
+                    if entry.success and entry.release_handle is not None
+                )
+            if pending_delivery is not None:
+                self._wait(pending_delivery)
             if claims:
                 self._release_claim_handles(claims)
             if not scoped:
@@ -900,8 +914,9 @@ class KVCRStore(HiCacheStorage):
                 retain = move or (mode == "copy" and self._retain_hinted_reads)
                 if retain:
                     # The fetches and the local delivery all wait in here.
-                    handle, result = self._retain_read(blocks, extra_info, move=move)
-                    submitted = time.perf_counter() if diagnostic else None
+                    handle, result, submitted = self._retain_read(
+                        blocks, extra_info, move=move
+                    )
                 else:
                     handle = (
                         self._runner.deposit(blocks)

@@ -1085,6 +1085,41 @@ class TestKVCRStorage(CustomTestCase):
             for actual, wanted in zip(pool.buffers, expected[name]):
                 self.assertTrue(torch.equal(actual[:4], wanted[:4]))
 
+    def test_retained_read_timing_includes_completion_waits(self):
+        backend, _, transport, transfers, info, _ = self._move_fixture(
+            enabled=False, retain=True
+        )
+        info.extra_info["kv_hints"]["actions"][0]["payload"]["mode"] = "copy"
+        backend._diagnostic_telemetry = True
+        backend._control_endpoint = "tcp://receiver:32100"
+        clock = [0.0]
+        poll_completed = transport.poll_completed
+
+        def delayed_completion():
+            clock[0] += 0.025
+            return poll_completed()
+
+        transport.poll_completed = delayed_completion
+        with (
+            patch(
+                "sglang.srt.mem_cache.storage.kvcr.kvcr_store.time.perf_counter",
+                side_effect=lambda: clock[0],
+            ),
+            self.assertLogs(
+                "sglang.srt.mem_cache.storage.kvcr.kvcr_store", level="INFO"
+            ) as captured,
+        ):
+            result = backend.batch_get_v2(transfers, info)
+        self.assertTrue(all(all(flags) for flags in result.values()))
+        records = [
+            json.loads(line.split("KVCR L3 operation ", 1)[1])
+            for line in captured.output
+            if "KVCR L3 operation " in line
+        ]
+        self.assertEqual(len(records), 1)
+        self.assertGreaterEqual(records[0]["wait_ms"], 25)
+        self.assertEqual(records[0]["submit_ms"], 0)
+
     def test_failed_indexer_copy_preserves_the_complete_source(self):
         for raises in (False, True):
             with self.subTest(raises=raises):
@@ -1239,7 +1274,11 @@ class TestKVCRStorage(CustomTestCase):
         self.assertFalse(transport.storage)
 
     def test_prefetch_metadata_publishes_only_retained_move_pages(self):
-        for mode, retain, count in (("copy", False, 0), ("copy", True, 4), ("move", False, 4)):
+        for mode, retain, count in (
+            ("copy", False, 0),
+            ("copy", True, 4),
+            ("move", False, 4),
+        ):
             with self.subTest(mode=mode, retain=retain):
                 backend, _, transport, transfers, info, _ = self._move_fixture(
                     publish=True, retain=retain
